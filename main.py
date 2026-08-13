@@ -10,6 +10,7 @@ What this does:
   3. Register all Telegram command and message handlers
   4. Start polling loop (no webhook/server required)
 """
+import asyncio
 import logging
 import os
 import threading
@@ -81,6 +82,13 @@ async def post_init(application: Application) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Ensure an asyncio event loop exists in MainThread for Python 3.12+ / 3.14+
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     # 1. Initialise SQLite (creates bot.db + tables if missing)
     logger.info("Initialising database...")
     init_db()
