@@ -11,7 +11,11 @@ What this does:
   4. Start polling loop (no webhook/server required)
 """
 import logging
+import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -41,6 +45,39 @@ logging.getLogger("httpx").setLevel(logging.WARNING)   # silence noisy HTTP logs
 logger = logging.getLogger(__name__)
 
 
+# ── Render Web Service Health Check Server ───────────────────────────────────
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+    def log_message(self, format, *args):
+        pass  # silence healthcheck logs
+
+
+def start_health_check_server() -> None:
+    port_str = os.getenv("PORT")
+    if port_str:
+        try:
+            port = int(port_str)
+            server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            logger.info(f"Health check HTTP server started on port {port}")
+        except Exception as e:
+            logger.warning(f"Could not start HTTP server on port {port_str}: {e}")
+
+
+# ── Async Post-Init Hook ──────────────────────────────────────────────────────
+
+async def post_init(application: Application) -> None:
+    logger.info("Starting scheduler in running event loop...")
+    init_scheduler()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -48,12 +85,16 @@ def main() -> None:
     logger.info("Initialising database...")
     init_db()
 
-    # 2. Start the APScheduler for reminder jobs
-    logger.info("Starting scheduler...")
-    init_scheduler()
+    # 2. Start optional health check server for Render Web Service deployment
+    start_health_check_server()
 
     # 3. Build the Telegram Application
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     # 4. Register command handlers
     app.add_handler(CommandHandler("start",     start))

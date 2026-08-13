@@ -30,7 +30,13 @@ def init_scheduler() -> AsyncIOScheduler:
     """Create and start the global AsyncIOScheduler. Call once in main.py."""
     global _scheduler
     if _scheduler is None:
-        _scheduler = AsyncIOScheduler(timezone="UTC")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        _scheduler = AsyncIOScheduler(timezone="UTC", event_loop=loop)
         _scheduler.start()
         logger.info("APScheduler started.")
     return _scheduler
