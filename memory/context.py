@@ -50,7 +50,7 @@ async def get_context(user_id: int, limit: int = MAX_HISTORY) -> list[dict]:
         rows = conn.execute(
             """
             SELECT role, content FROM (
-                SELECT role, content, created_at
+                SELECT id, role, content, created_at
                 FROM messages
                 WHERE user_id = ?
                 ORDER BY created_at DESC, id DESC

@@ -80,6 +80,17 @@ async def extract_reminder(message: str, profile: dict) -> dict | None:
         dict {content: str, remind_at: datetime} if a future reminder found,
         None otherwise.
     """
+    # ── Pre-filter: skip Gemini call if message lacks time/reminder trigger words ──
+    lower_msg = message.lower()
+    trigger_words = (
+        "remind", "reminder", "alarm", "schedule", "alert", "notify",
+        "tomorrow", "tonight", "today", "yesterday",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+        "am", "pm", "o'clock", "meeting", "call", "appointment", "deadline", "wake me",
+        "at 1", "at 2", "at 3", "at 4", "at 5", "at 6", "at 7", "at 8", "at 9", "at 10", "at 11", "at 12"
+    )
+    if not any(word in lower_msg for word in trigger_words):
+        return None
     tz_str = profile.get("timezone", "Asia/Kolkata")
     try:
         tz = ZoneInfo(tz_str)

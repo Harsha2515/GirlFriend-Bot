@@ -48,11 +48,14 @@ try:
 except Exception as e:
     errors.append(f"[FAIL] agent.extractor: {e}")
 
+import asyncio
 try:
     from scheduler.jobs import init_scheduler
-    sched = init_scheduler()
-    print(f"[OK] scheduler.jobs: running={sched.running}")
-    sched.shutdown(wait=False)
+    async def _test_sched():
+        sched = init_scheduler()
+        print(f"[OK] scheduler.jobs: running={sched.running}")
+        sched.shutdown(wait=False)
+    asyncio.run(_test_sched())
 except Exception as e:
     errors.append(f"[FAIL] scheduler.jobs: {e}")
 
