@@ -30,6 +30,27 @@ PERSONA_BUTTON_MAP = {
 }
 
 
+import asyncio
+
+async def _process_reminder_background(user_id: int, user_text: str, profile: dict, bot) -> None:
+    """Background worker for reminder extraction."""
+    try:
+        reminder = await extract_reminder(user_text, profile)
+        if reminder:
+            job_id = await schedule_reminder(
+                user_id   = user_id,
+                content   = reminder["content"],
+                remind_at = reminder["remind_at"],
+                bot       = bot,
+            )
+            logger.info(
+                f"Reminder scheduled for user {user_id}: "
+                f"'{reminder['content']}' @ {reminder['remind_at']} (job: {job_id})"
+            )
+    except Exception as exc:
+        logger.warning(f"Reminder extraction failed for user {user_id}: {exc}")
+
+
 # ── Main message handler ───────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,22 +115,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await save_message(tg_id, role="user",      content=user_text, persona=active_persona)
     await save_message(tg_id, role="assistant", content=reply,     persona=active_persona)
 
-    # ── 7. Reminder extraction (non-blocking; failure is safe to ignore) ──────
-    try:
-        reminder = await extract_reminder(user_text, profile)
-        if reminder:
-            job_id = await schedule_reminder(
-                user_id   = tg_id,
-                content   = reminder["content"],
-                remind_at = reminder["remind_at"],
-                bot       = context.bot,
-            )
-            logger.info(
-                f"Reminder scheduled for user {tg_id}: "
-                f"'{reminder['content']}' @ {reminder['remind_at']} (job: {job_id})"
-            )
-    except Exception as exc:
-        logger.warning(f"Reminder extraction/scheduling failed for user {tg_id}: {exc}")
+    # ── 7. Reminder extraction (background task — 100% non-blocking) ─────────
+    asyncio.create_task(_process_reminder_background(tg_id, user_text, profile, context.bot))
 
 
 # ── Global error handler ───────────────────────────────────────────────────────
