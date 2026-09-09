@@ -264,13 +264,19 @@ read-only, so it's safe to run while the bot is live:
 ```bash
 python tools/chats.py stats               # overview: users, messages, usage
 python tools/chats.py users               # everyone, with message counts
-python tools/chats.py chat 123456789      # one person's conversation
-python tools/chats.py chat 123456789 -n 100
+python tools/chats.py chat Priya          # one person's conversation
+python tools/chats.py chat @priya_k       # by username
+python tools/chats.py chat 987654321      # by Telegram ID
+python tools/chats.py chat Priya -n 100   # last 100 messages
 python tools/chats.py search "meeting"    # find messages by text
-python tools/chats.py facts 123456789     # what it remembers about them
-python tools/chats.py reminders 123456789
-python tools/chats.py export 123456789    # dump one chat to a .txt file
+python tools/chats.py facts Priya         # what it remembers about them
+python tools/chats.py reminders Priya
+python tools/chats.py export Priya        # dump one chat to a .txt file
 ```
+
+You don't need to know anyone's Telegram ID — run `users` to see everyone, or
+just use their name. Names and usernames match case-insensitively and a prefix
+is enough; an ambiguous name lists the candidates rather than guessing.
 
 On the VM: `cd ~/GirlFriend-Bot && ./venv/bin/python tools/chats.py users`
 
