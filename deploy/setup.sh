@@ -101,9 +101,25 @@ sudo systemctl restart "$SERVICE_NAME"
 
 # ── 8. Nightly database backup ────────────────────────────────────────────────
 say "Scheduling the nightly backup"
-CRON_LINE="0 3 * * * $APP_DIR/deploy/backup.sh >> $APP_DIR/backups/backup.log 2>&1"
-( crontab -l 2>/dev/null | grep -v 'deploy/backup.sh' ; echo "$CRON_LINE" ) | crontab -
 chmod +x "$APP_DIR/deploy/backup.sh"
+mkdir -p "$APP_DIR/backups"
+
+# Build the new crontab in a temp file rather than piping straight into
+# `crontab -`. On a fresh VM there is no crontab yet, so `crontab -l` exits 1
+# and `grep -v` exits 1 when it matches nothing -- under `set -e` plus
+# `pipefail` either one kills the script, and an aborted pipe would hand
+# `crontab -` an empty stdin and wipe the crontab entirely.
+CRON_LINE="0 3 * * * $APP_DIR/deploy/backup.sh >> $APP_DIR/backups/backup.log 2>&1"
+CRON_TMP="$(mktemp)"
+crontab -l 2>/dev/null | grep -v 'deploy/backup.sh' > "$CRON_TMP" || true
+echo "$CRON_LINE" >> "$CRON_TMP"
+
+if crontab "$CRON_TMP"; then
+    echo "    nightly backup scheduled for 03:00"
+else
+    warn "Could not install the cron entry -- run deploy/backup.sh manually."
+fi
+rm -f "$CRON_TMP"
 
 # ── 9. Report ─────────────────────────────────────────────────────────────────
 sleep 4

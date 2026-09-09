@@ -47,10 +47,10 @@ fi
 gzip -f "$TARGET"
 
 # Rotate: keep the newest $KEEP, delete the rest.
-ls -1t "$BACKUP_DIR"/bot-*.db.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f
+ls -1t "$BACKUP_DIR"/bot-*.db.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f || true
 
 SIZE="$(du -h "$TARGET.gz" | cut -f1)"
-COUNT="$(ls -1 "$BACKUP_DIR"/bot-*.db.gz 2>/dev/null | wc -l)"
+COUNT="$(ls -1 "$BACKUP_DIR"/bot-*.db.gz 2>/dev/null | wc -l || echo 0)"
 echo "$(date -Is) [ok] $TARGET.gz ($SIZE), $COUNT backup(s) retained"
 
 # To restore:

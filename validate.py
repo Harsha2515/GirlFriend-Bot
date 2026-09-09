@@ -7,6 +7,7 @@ burning Gemini quota.
 
     python validate.py
 """
+import os
 import asyncio
 import sys
 from datetime import datetime, timedelta
@@ -138,5 +139,6 @@ if errors:
 
 print("ALL CHECKS PASSED")
 print()
-print("  Run the bot with:  venv\\Scripts\\python main.py")
+_hint = "venv\\Scripts\\python main.py" if os.name == "nt" else "./venv/bin/python main.py"
+print(f"  Run the bot with:  {_hint}")
 print("=" * 52)
