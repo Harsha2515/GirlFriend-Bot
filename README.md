@@ -78,7 +78,19 @@ Open Telegram, send `/start`, pick a persona. Done 🎉
 | `/cancel <id>` | Cancel a commitment and all its nudges |
 | `/facts` | See what it remembers about you (`/facts clear` to wipe) |
 | `/forget` | Clear conversation history |
+| `/whoami` | Show your Telegram user ID |
 | `/help` | Show all commands |
+
+**Admin only** (silently ignored for everyone else):
+
+| Command | Description |
+|---|---|
+| `/pending` | List people waiting for approval |
+| `/approve <id>` | Grant access |
+| `/deny <id>` | Send back to the pending queue |
+| `/block <id>` | Block permanently |
+| `/users` | Counts per status + auto-approve slots left |
+| `/usage` | Daily API consumption vs the free-tier budget |
 
 ---
 
@@ -141,9 +153,20 @@ without losing anything.
 │   ├── context.py            # Conversation history
 │   └── user_profile.py       # Profile + long-term facts
 │
-└── scheduler/
-    ├── jobs.py               # Lead-time planning, firing, restart recovery
-    └── reminder_store.py     # Reminder CRUD + dedup
+├── memory/
+│   └── usage.py              # Daily counters + free-tier guards
+│
+├── scheduler/
+│   ├── jobs.py               # Lead-time planning, firing, restart recovery
+│   └── reminder_store.py     # Reminder CRUD + dedup
+│
+├── tools/
+│   └── chats.py              # Read stored conversations (read-only)
+│
+└── deploy/
+    ├── setup.sh              # One-command VM provisioning
+    ├── backup.sh             # Nightly SQLite snapshot
+    └── gfbot.service         # systemd unit
 ```
 
 ---
@@ -187,6 +210,81 @@ loss isn't something you can work around for free.
 > outbound whitelist. **Railway** is trial credit, not a free tier.
 
 Whatever you pick, `bot.db` holds everything — keep a copy off the box.
+
+---
+
+## Multiple users
+
+The bot is multi-user out of the box — every person gets their own persona,
+history, facts, reminders, and timezone, all keyed by Telegram user ID. One
+person can never see or cancel another's data.
+
+**Access control.** The first `AUTO_APPROVE_LIMIT` people (default 50) are
+approved automatically. After that, newcomers get an "invite-only" reply and
+land in a queue; you get a Telegram notification and approve with
+`/approve <id>`. You are always approved, so a full queue can't lock you out.
+
+**Free-tier guards — this is the part that matters.** Headcount is not the
+real constraint; Gemini calls per day are. Every message costs **2 API calls**
+(reply + analysis), so 50 chatty users would exhaust the free quota long
+before you noticed. Two ceilings prevent that:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `USER_DAILY_MESSAGE_LIMIT` | 30 | One person can't drain the day for everyone |
+| `GLOBAL_DAILY_API_LIMIT` | 1000 | The whole bot stops before Google says 429 |
+
+When a ceiling is reached the bot says so honestly ("I've used up my daily
+quota — it resets in a few hours") instead of failing with a generic error.
+The admin is exempt from the per-user cap but **not** the global one, since
+that ceiling exists to protect the API key itself.
+
+Set `GLOBAL_DAILY_API_LIMIT` below your key's real daily quota — check it at
+[AI Studio](https://aistudio.google.com) — and leave margin.
+
+> ⚠️ On the free tier, Google may use API data to improve its products. That's
+> your call for your own chats; tell people before inviting them.
+
+---
+
+## Reading the stored chats
+
+Everything lives in one SQLite file — `bot.db` — with four tables:
+
+| Table | Holds |
+|---|---|
+| `users` | One row per person: name, persona, timezone, access status |
+| `messages` | Every turn: `user_id`, `role` (user/assistant), `content`, timestamp |
+| `user_facts` | Durable facts learned about each person |
+| `reminders` | One row per nudge, grouped by `group_id` per commitment |
+
+`tools/chats.py` reads it without you writing SQL. It opens the database
+read-only, so it's safe to run while the bot is live:
+
+```bash
+python tools/chats.py stats               # overview: users, messages, usage
+python tools/chats.py users               # everyone, with message counts
+python tools/chats.py chat 123456789      # one person's conversation
+python tools/chats.py chat 123456789 -n 100
+python tools/chats.py search "meeting"    # find messages by text
+python tools/chats.py facts 123456789     # what it remembers about them
+python tools/chats.py reminders 123456789
+python tools/chats.py export 123456789    # dump one chat to a .txt file
+```
+
+On the VM: `cd ~/GirlFriend-Bot && ./venv/bin/python tools/chats.py users`
+
+Raw SQL still works if you prefer it:
+
+```bash
+sqlite3 bot.db "SELECT role, content FROM messages WHERE user_id=123 ORDER BY id DESC LIMIT 20;"
+```
+
+**Retention.** Only the last 20 messages per user are ever sent to the model,
+so history never slows the bot down or costs more as it grows. Older rows are
+kept purely so you can read them, and pruned nightly to
+`MESSAGE_RETENTION_PER_USER` (default 400). Measured growth is ~349 bytes per
+message — about 49 MB/year for 10 active users, against a 47 GB disk.
 
 ---
 

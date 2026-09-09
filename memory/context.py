@@ -92,3 +92,46 @@ def trim_to_budget(messages: list[dict], max_tokens: int = 3000) -> list[dict]:
     while messages and estimate_tokens(messages) > max_tokens:
         messages = messages[1:]
     return messages
+
+# ── Retention ─────────────────────────────────────────────────────────────────
+
+async def prune_old_messages(keep_per_user: int) -> int:
+    """
+    Keep only the newest `keep_per_user` messages for each user.
+
+    Only the last MAX_HISTORY messages are ever sent to the model, so older
+    rows are readable history rather than working memory. Pruning keeps the
+    database small enough to back up quickly and restore in seconds.
+
+    Returns the number of rows deleted. A value <= 0 disables pruning.
+    """
+    if keep_per_user <= 0:
+        return 0
+
+    def _prune():
+        conn = get_conn()
+        cur = conn.execute(
+            """
+            DELETE FROM messages
+            WHERE id NOT IN (
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY user_id ORDER BY id DESC
+                           ) AS rn
+                    FROM messages
+                )
+                WHERE rn <= ?
+            )
+            """,
+            (keep_per_user,),
+        )
+        deleted = cur.rowcount
+        conn.commit()
+        if deleted > 0:
+            # Reclaim the freed pages; cheap at this scale and keeps backups small.
+            conn.execute("VACUUM")
+            logger.info(f"Pruned {deleted} old messages (keeping {keep_per_user}/user)")
+        return deleted
+
+    return await asyncio.get_event_loop().run_in_executor(None, _prune)

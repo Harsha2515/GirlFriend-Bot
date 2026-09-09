@@ -24,19 +24,28 @@ from telegram.ext import (
 )
 
 from bot.commands import (
+    approve,
+    block,
     cancel,
+    deny,
     facts_command,
     forget,
     help_command,
     mode,
     name_command,
+    pending,
     reminders,
     start,
     timezone_command,
+    usage_command,
+    users_command,
+    whoami,
 )
 from bot.handlers import handle_message, error_handler
-from config import TELEGRAM_BOT_TOKEN
+from config import ADMIN_USER_ID, MESSAGE_RETENTION_PER_USER, TELEGRAM_BOT_TOKEN
+from memory.context import prune_old_messages
 from memory.models import init_db
+from memory.usage import prune_usage
 from scheduler.jobs import init_scheduler, restore_pending
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -88,10 +97,38 @@ async def post_init(application: Application) -> None:
     Restoring reminders here is what makes them survive a restart: APScheduler
     keeps jobs in memory, but the reminders table is the source of truth.
     """
-    init_scheduler()
+    scheduler = init_scheduler()
     summary = await restore_pending(application.bot)
     if summary["late"]:
         logger.info(f"{summary['late']} reminder(s) missed while offline — sending now.")
+
+    if not ADMIN_USER_ID:
+        logger.warning(
+            "ADMIN_USER_ID is not set. Nobody can approve new users once the "
+            "auto-approve limit fills. Send /whoami to the bot, then put your "
+            "ID in .env."
+        )
+
+    # Nightly housekeeping at 03:30 UTC, just after the backup cron at 03:00
+    # so the backup captures the pre-prune state.
+    scheduler.add_job(
+        _nightly_maintenance,
+        trigger="cron",
+        hour=3,
+        minute=30,
+        id="nightly_maintenance",
+        replace_existing=True,
+    )
+
+
+async def _nightly_maintenance() -> None:
+    """Trim message history and old usage counters."""
+    try:
+        pruned = await prune_old_messages(MESSAGE_RETENTION_PER_USER)
+        rows = await prune_usage(keep_days=90)
+        logger.info(f"Nightly maintenance: {pruned} messages, {rows} usage rows pruned.")
+    except Exception as exc:
+        logger.error(f"Nightly maintenance failed: {exc}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -120,6 +157,15 @@ def main() -> None:
     app.add_handler(CommandHandler("facts",     facts_command))
     app.add_handler(CommandHandler("forget",    forget))
     app.add_handler(CommandHandler("help",      help_command))
+    app.add_handler(CommandHandler("whoami",    whoami))
+
+    # Admin only — silently ignored for everyone else.
+    app.add_handler(CommandHandler("approve",   approve))
+    app.add_handler(CommandHandler("deny",      deny))
+    app.add_handler(CommandHandler("block",     block))
+    app.add_handler(CommandHandler("pending",   pending))
+    app.add_handler(CommandHandler("users",     users_command))
+    app.add_handler(CommandHandler("usage",     usage_command))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)

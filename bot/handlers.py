@@ -21,8 +21,15 @@ from telegram.ext import ContextTypes
 from agent.extractor import analyze_message
 from agent.llm import call_llm
 from agent.persona import build_system_prompt
+from config import ADMIN_USER_ID, AUTO_APPROVE_LIMIT
 from memory.context import get_context, save_message, trim_to_budget
-from memory.user_profile import add_user_fact, create_or_update_user, get_user
+from memory.usage import check_limits, record_message
+from memory.user_profile import (
+    add_user_fact,
+    create_or_update_user,
+    get_user,
+    register_user,
+)
 from scheduler.jobs import schedule_commitment
 from scheduler.reminder_store import has_similar_pending
 
@@ -107,6 +114,55 @@ async def _handle_commitments(
     return lines
 
 
+async def _handle_unapproved(update: Update, context, user, status: str) -> None:
+    """
+    Reply to someone who isn't approved, and ping the admin the first time.
+
+    The admin notification is best-effort and deliberately rate-limited to one
+    per user per process: a blocked stranger retrying in a loop must not turn
+    into a flood of Telegram messages to you.
+    """
+    if status == "blocked":
+        await update.message.reply_text(
+            "Sorry, you don't have access to this bot."
+        )
+        return
+
+    await update.message.reply_text(
+        "Hi! 👋 This bot is currently invite-only.\n\n"
+        "Your request has been sent to the admin — you'll get a message here "
+        "once you're approved. Nothing else to do for now!"
+    )
+
+    if not ADMIN_USER_ID:
+        logger.warning(
+            f"User {user.id} is pending but ADMIN_USER_ID is unset — "
+            "nobody can approve them. Set it in .env."
+        )
+        return
+
+    notified = context.application.bot_data.setdefault("notified_pending", set())
+    if user.id in notified:
+        return
+    notified.add(user.id)
+
+    handle = f"@{user.username}" if user.username else "(no username)"
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=(
+                f"🔔 New access request\n\n"
+                f"Name: {user.first_name or 'unknown'}\n"
+                f"Username: {handle}\n"
+                f"User ID: {user.id}\n\n"
+                f"Approve: /approve {user.id}\n"
+                f"Deny:    /deny {user.id}"
+            ),
+        )
+    except Exception as exc:
+        logger.warning(f"Could not notify admin about user {user.id}: {exc}")
+
+
 async def _store_facts(user_id: int, facts: list[str]) -> None:
     """Persist newly learned long-term facts about the user."""
     for fact in facts:
@@ -124,17 +180,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     tg_id     = user.id
     user_text = update.message.text.strip()
 
-    # ── 1. Load / create user profile ────────────────────────────────────────
-    profile = await get_user(tg_id)
-    if not profile:
-        await create_or_update_user(
-            user_id    = tg_id,
-            username   = user.username or "",
-            first_name = user.first_name or "friend",
-        )
-        profile = await get_user(tg_id)
+    # ── 1. Access control ────────────────────────────────────────────────────
+    # Runs before anything else: a pending or blocked user must never reach
+    # the Gemini calls, since those are the scarce free-tier resource.
+    status = await register_user(
+        user_id            = tg_id,
+        username           = user.username or "",
+        first_name         = user.first_name or "friend",
+        auto_approve_limit = AUTO_APPROVE_LIMIT,
+        is_admin           = tg_id == ADMIN_USER_ID,
+    )
+    if status != "approved":
+        await _handle_unapproved(update, context, user, status)
+        return
 
-    # ── 2. Handle persona-picker keyboard replies ─────────────────────────────
+    # ── 2. Free-tier guards ──────────────────────────────────────────────────
+    allowed, reason = await check_limits(tg_id, is_admin=tg_id == ADMIN_USER_ID)
+    if not allowed:
+        await update.message.reply_text(reason)
+        return
+
+    profile = await get_user(tg_id)
+
+    # ── 3. Handle persona-picker keyboard replies ─────────────────────────────
     if user_text.lower() in PERSONA_BUTTON_MAP:
         persona = PERSONA_BUTTON_MAP[user_text.lower()]
         await create_or_update_user(user_id=tg_id, active_persona=persona)
@@ -143,14 +211,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # ── 3. Build conversation context ─────────────────────────────────────────
+    # ── 4. Build conversation context ─────────────────────────────────────────
     active_persona = profile.get("active_persona", "girlfriend")
     history        = trim_to_budget(await get_context(tg_id), max_tokens=3000)
     system_prompt  = await build_system_prompt(profile, active_persona)
 
     await context.bot.send_chat_action(chat_id=tg_id, action="typing")
 
-    # ── 4. Reply and analysis run together, so analysis is effectively free ───
+    # ── 5. Reply and analysis run together, so analysis is effectively free ───
     analysis_task = asyncio.create_task(
         analyze_message(user_text, profile, history)
     )
@@ -176,7 +244,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.warning(f"Analysis failed for user {tg_id}: {exc}")
         analysis = {"commitments": [], "facts": []}
 
-    # ── 5. Schedule commitments and confirm them in the same message ─────────
+    # ── 6. Schedule commitments and confirm them in the same message ─────────
     confirmations = await _handle_commitments(
         analysis["commitments"], tg_id, profile, context.bot
     )
@@ -189,10 +257,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # make Telegram reject the whole message.
     await update.message.reply_text(message)
 
-    # ── 6. Persist the turn and anything new we learned ──────────────────────
+    # ── 7. Persist the turn and anything new we learned ──────────────────────
     await save_message(tg_id, role="user",      content=user_text, persona=active_persona)
     await save_message(tg_id, role="assistant", content=reply,     persona=active_persona)
     await _store_facts(tg_id, analysis["facts"])
+
+    # Counted after the fact, so a failed turn doesn't spend the user's budget.
+    await record_message(tg_id)
 
 
 # ── Global error handler ───────────────────────────────────────────────────────

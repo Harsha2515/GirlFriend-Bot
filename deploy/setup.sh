@@ -69,10 +69,29 @@ fi
 if [ ! -f "$APP_DIR/.env" ]; then
     say "Creating .env -- you must fill this in"
     cat > "$APP_DIR/.env" <<'ENVEOF'
+# Required
 TELEGRAM_BOT_TOKEN=
 GEMINI_API_KEY=
+
+# Your Telegram user ID. Send /whoami to the bot to find it.
+# Without this, nobody can approve new users once the auto-approve cap fills.
+ADMIN_USER_ID=
+
 DB_PATH=bot.db
 TIMEZONE_DEFAULT=Asia/Kolkata
+
+# Access control: the first N people are approved automatically,
+# then newcomers queue for /approve.
+AUTO_APPROVE_LIMIT=50
+
+# Free-tier guards. The bot stops itself before Gemini starts returning 429.
+# Every message costs 2 API calls. Check your real quota at aistudio.google.com
+# and leave margin below it.
+USER_DAILY_MESSAGE_LIMIT=30
+GLOBAL_DAILY_API_LIMIT=1000
+
+# Messages kept per user (only the last 20 are ever sent to the model).
+MESSAGE_RETENTION_PER_USER=400
 ENVEOF
     chmod 600 "$APP_DIR/.env"
     warn "Edit $APP_DIR/.env with your two keys, then re-run this script."

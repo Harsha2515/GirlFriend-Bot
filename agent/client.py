@@ -22,12 +22,16 @@ logger = logging.getLogger(__name__)
 
 _client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Conversational replies — quality matters, so full Flash first.
+# Conversational replies. Lite first, deliberately: measured against this key
+# the lite models answer in ~1s versus 20-43s for gemini-flash-latest, the
+# persona quality is indistinguishable for casual chat, and the free-tier
+# limits are far more generous — which is what lets several people share one
+# key. Heavier models remain as fallbacks if the lite tier is exhausted.
 CHAT_MODELS = [
-    "gemini-flash-latest",
-    "gemini-3.5-flash",
-    "gemini-2.5-flash",
     "gemini-flash-lite-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-flash-latest",
 ]
 
 # Structured JSON extraction — Lite is plenty and costs far less quota.

@@ -87,6 +87,29 @@ def _migrate_reminders(conn: sqlite3.Connection) -> None:
     logger.info("Reminders table migrated.")
 
 
+def _migrate_users(conn: sqlite3.Connection) -> None:
+    """
+    Add the access-control columns to an existing users table.
+
+    Everyone already in the database predates the approval gate, so they are
+    grandfathered in as 'approved' -- the DEFAULT on the new column does that
+    for existing rows automatically.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+
+    if "status" not in columns:
+        logger.info("Adding access-control columns to users table...")
+        # 'approved' | 'pending' | 'blocked'. No CHECK constraint: SQLite can't
+        # add one via ALTER TABLE, and the values are only ever set in code.
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"
+        )
+    if "approved_at" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN approved_at TEXT")
+    if "requested_at" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN requested_at TEXT")
+
+
 def init_db() -> None:
     """Create all tables if they don't exist, then apply migrations."""
     conn = get_conn()
@@ -122,9 +145,21 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_facts_user
             ON user_facts(user_id);
+
+        -- Daily counters used to stop the bot before Gemini's free-tier
+        -- quota does. user_id 0 is the reserved row holding the global
+        -- total for that day.
+        CREATE TABLE IF NOT EXISTS usage_daily (
+            day       TEXT    NOT NULL,          -- 'YYYY-MM-DD' in UTC
+            user_id   INTEGER NOT NULL,          -- 0 = whole-bot total
+            messages  INTEGER NOT NULL DEFAULT 0,
+            api_calls INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (day, user_id)
+        );
         """
     )
 
+    _migrate_users(conn)
     _migrate_reminders(conn)
     conn.executescript(_REMINDERS_SCHEMA)
     conn.executescript(

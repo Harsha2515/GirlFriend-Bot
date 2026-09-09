@@ -10,6 +10,7 @@ Provides:
 """
 import logging
 import asyncio
+from datetime import datetime, timezone
 from memory.models import get_conn
 
 logger = logging.getLogger(__name__)
@@ -151,3 +152,128 @@ async def clear_user_facts(user_id: int) -> int:
         return cur.rowcount
 
     return await asyncio.get_event_loop().run_in_executor(None, _clear)
+
+
+# ── Access control ────────────────────────────────────────────────────────────
+
+async def count_users(status: str = "approved") -> int:
+    """How many users currently hold this status."""
+    def _count():
+        conn = get_conn()
+        return conn.execute(
+            "SELECT COUNT(*) FROM users WHERE status = ?", (status,)
+        ).fetchone()[0]
+
+    return await asyncio.get_event_loop().run_in_executor(None, _count)
+
+
+async def register_user(
+    user_id: int,
+    username: str,
+    first_name: str,
+    auto_approve_limit: int,
+    is_admin: bool = False,
+) -> str:
+    """
+    Ensure a user row exists and return their status.
+
+    The first `auto_approve_limit` people through the door are approved
+    automatically; after that newcomers land in the pending queue for the
+    admin to approve. The admin is always approved, so a full queue can never
+    lock you out of your own bot.
+
+    Returns 'approved', 'pending' or 'blocked'.
+    """
+    def _register():
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT status FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+
+        if row is not None:
+            # Keep display details fresh, but never touch an existing status.
+            conn.execute(
+                "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
+                (username or "", first_name or "friend", user_id),
+            )
+            conn.commit()
+            return row["status"]
+
+        approved_count = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE status = 'approved'"
+        ).fetchone()[0]
+
+        if is_admin or auto_approve_limit <= 0 or approved_count < auto_approve_limit:
+            status = "approved"
+        else:
+            status = "pending"
+
+        conn.execute(
+            """
+            INSERT INTO users
+                (user_id, username, first_name, status, approved_at, requested_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                username or "",
+                first_name or "friend",
+                status,
+                datetime.now(timezone.utc).isoformat() if status == "approved" else None,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+        logger.info(
+            f"New user {user_id} ({first_name}) registered as '{status}' "
+            f"({approved_count}/{auto_approve_limit} approved before this)"
+        )
+        return status
+
+    return await asyncio.get_event_loop().run_in_executor(None, _register)
+
+
+async def set_status(user_id: int, status: str) -> bool:
+    """
+    Set a user's access status to 'approved', 'pending' or 'blocked'.
+    Returns False if there is no such user.
+    """
+    if status not in ("approved", "pending", "blocked"):
+        raise ValueError(f"invalid status: {status}")
+
+    def _set():
+        conn = get_conn()
+        approved_at = (
+            datetime.now(timezone.utc).isoformat() if status == "approved" else None
+        )
+        cur = conn.execute(
+            "UPDATE users SET status = ?, approved_at = COALESCE(?, approved_at) "
+            "WHERE user_id = ?",
+            (status, approved_at, user_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+    return await asyncio.get_event_loop().run_in_executor(None, _set)
+
+
+async def list_users(status: str | None = None, limit: int = 100) -> list[dict]:
+    """List users, optionally filtered by status, newest request first."""
+    def _list():
+        conn = get_conn()
+        if status:
+            rows = conn.execute(
+                "SELECT user_id, username, first_name, status, requested_at, created_at "
+                "FROM users WHERE status = ? "
+                "ORDER BY COALESCE(requested_at, created_at) DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT user_id, username, first_name, status, requested_at, created_at "
+                "FROM users ORDER BY COALESCE(requested_at, created_at) DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    return await asyncio.get_event_loop().run_in_executor(None, _list)

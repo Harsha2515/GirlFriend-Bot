@@ -16,17 +16,29 @@ an unbalanced '*' or '_' would make Telegram reject the entire message.
 """
 import logging
 from datetime import datetime
+from functools import wraps
 from zoneinfo import ZoneInfo, available_timezones
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ContextTypes
 
+from config import (
+    ADMIN_USER_ID,
+    AUTO_APPROVE_LIMIT,
+    GLOBAL_DAILY_API_LIMIT,
+    USER_DAILY_MESSAGE_LIMIT,
+)
 from memory.context import clear_history
+from memory.usage import usage_summary
 from memory.user_profile import (
+    clear_user_facts,
+    count_users,
     create_or_update_user,
     get_user,
     get_user_facts,
-    clear_user_facts,
+    list_users,
+    register_user,
+    set_status,
 )
 from scheduler.jobs import cancel_jobs
 from scheduler.reminder_store import cancel_group, get_pending_groups
@@ -59,11 +71,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Onboard a new user: save profile and present the persona picker."""
     user = update.effective_user
 
-    await create_or_update_user(
-        user_id    = user.id,
-        username   = user.username or "",
-        first_name = user.first_name or "friend",
+    # Same gate as handle_message -- /start must not be a way around approval.
+    status = await register_user(
+        user_id            = user.id,
+        username           = user.username or "",
+        first_name         = user.first_name or "friend",
+        auto_approve_limit = AUTO_APPROVE_LIMIT,
+        is_admin           = user.id == ADMIN_USER_ID,
     )
+    if status == "blocked":
+        await update.message.reply_text("Sorry, you don't have access to this bot.")
+        return
+    if status == "pending":
+        await update.message.reply_text(
+            "Hi! 👋 This bot is currently invite-only.\n\n"
+            "Your request has been sent to the admin — you'll get a message "
+            "here once you're approved."
+        )
+        return
 
     reply_markup = ReplyKeyboardMarkup(
         PERSONA_KEYBOARD, one_time_keyboard=True, resize_keyboard=True
@@ -276,7 +301,160 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/cancel <id> — Cancel a commitment\n"
         "/facts — See what I remember about you (/facts clear to wipe)\n"
         "/forget — Clear conversation history\n"
+        "/whoami — Show your Telegram user ID\n"
         "/help — Show this message\n\n"
         "Just chat normally. Anything you mention having to do gets picked up "
         "automatically — I'll nudge you the night before and an hour ahead."
     )
+
+
+# ── Admin commands ────────────────────────────────────────────────────────────
+
+def admin_only(func):
+    """
+    Restrict a command to ADMIN_USER_ID.
+
+    Non-admins get the ordinary "unknown command" silence rather than a denial,
+    so the existence of these commands isn't advertised to strangers.
+    """
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not ADMIN_USER_ID or update.effective_user.id != ADMIN_USER_ID:
+            logger.info(
+                f"Ignoring admin command from non-admin {update.effective_user.id}"
+            )
+            return
+        return await func(update, context)
+
+    return wrapper
+
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report the caller's Telegram ID. Needed to set ADMIN_USER_ID in .env."""
+    user = update.effective_user
+    is_admin = ADMIN_USER_ID and user.id == ADMIN_USER_ID
+    await update.message.reply_text(
+        f"Your Telegram user ID is: {user.id}\n"
+        + ("\nYou are the admin ✅" if is_admin else "")
+    )
+
+
+def _parse_target_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    if not context.args:
+        return None
+    try:
+        return int(context.args[0].strip())
+    except ValueError:
+        return None
+
+
+async def _change_access(update, context, status: str, verb: str, note: str) -> None:
+    """Shared body for /approve, /deny and /block."""
+    target = _parse_target_id(context)
+    if target is None:
+        await update.message.reply_text(
+            f"Usage: /{verb} <user-id>\nSee /pending for IDs waiting on you."
+        )
+        return
+
+    if target == ADMIN_USER_ID and status != "approved":
+        await update.message.reply_text("You can't remove your own access.")
+        return
+
+    if not await set_status(target, status):
+        await update.message.reply_text(
+            f"No user with ID {target}. They must message the bot at least once first."
+        )
+        return
+
+    await update.message.reply_text(f"✅ User {target} is now '{status}'.")
+
+    # Tell them the good news; harmless if they've blocked the bot.
+    if note:
+        try:
+            await context.bot.send_message(chat_id=target, text=note)
+        except Exception as exc:
+            logger.info(f"Could not notify user {target} of access change: {exc}")
+
+
+@admin_only
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Grant a pending user access. Usage: /approve <user-id>"""
+    await _change_access(
+        update, context, "approved", "approve",
+        "🎉 You've been approved! Send /start to pick a persona and begin.",
+    )
+
+
+@admin_only
+async def deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a user back to pending. Usage: /deny <user-id>"""
+    await _change_access(update, context, "pending", "deny", "")
+
+
+@admin_only
+async def block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Block a user permanently. Usage: /block <user-id>"""
+    await _change_access(update, context, "blocked", "block", "")
+
+
+@admin_only
+async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List users waiting for approval."""
+    waiting = await list_users(status="pending")
+    if not waiting:
+        await update.message.reply_text("✅ Nobody is waiting for approval.")
+        return
+
+    lines = [f"⏳ {len(waiting)} waiting for approval:", ""]
+    for u in waiting:
+        handle = f"@{u['username']}" if u["username"] else "(no username)"
+        lines.append(f"• {u['first_name']} {handle}")
+        lines.append(f"    /approve {u['user_id']}    /block {u['user_id']}")
+    await update.message.reply_text("\n".join(lines))
+
+
+@admin_only
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show how many users hold each status, and how close the auto-approve cap is."""
+    approved = await count_users("approved")
+    waiting  = await count_users("pending")
+    blocked  = await count_users("blocked")
+
+    if AUTO_APPROVE_LIMIT > 0:
+        remaining = max(0, AUTO_APPROVE_LIMIT - approved)
+        gate = (
+            f"Auto-approve: {approved}/{AUTO_APPROVE_LIMIT} used"
+            + (f", {remaining} slot(s) left" if remaining else " — FULL, new users queue")
+        )
+    else:
+        gate = "Auto-approve: disabled (everyone queues)"
+
+    await update.message.reply_text(
+        f"👥 Users\n\n"
+        f"Approved: {approved}\n"
+        f"Pending:  {waiting}\n"
+        f"Blocked:  {blocked}\n\n"
+        f"{gate}"
+    )
+
+
+@admin_only
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recent daily API consumption against the free-tier budget."""
+    rows = await usage_summary(days=7)
+    if not rows:
+        await update.message.reply_text("No usage recorded yet.")
+        return
+
+    lines = [f"📊 Daily usage (budget: {GLOBAL_DAILY_API_LIMIT} API calls/day)", ""]
+    for r in rows:
+        calls = r["api_calls"] or 0
+        pct = f"{calls * 100 // GLOBAL_DAILY_API_LIMIT}%" if GLOBAL_DAILY_API_LIMIT else "-"
+        lines.append(
+            f"{r['day']}  {calls:>5} calls ({pct})  "
+            f"{r['messages'] or 0} msgs  {r['active_users'] or 0} users"
+        )
+
+    lines += ["", f"Per-user cap: {USER_DAILY_MESSAGE_LIMIT} messages/day"]
+    await update.message.reply_text("\n".join(lines))
