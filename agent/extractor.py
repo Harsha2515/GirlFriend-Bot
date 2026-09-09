@@ -1,169 +1,222 @@
 """
-agent/extractor.py — Reminder intent extraction from user messages.
+agent/extractor.py — Understands what a message implies beyond the chat reply.
 
-After every user message the main handler calls extract_reminder().
-It makes a secondary low-temperature Gemini call asking for JSON output
-describing any reminder intent in the message.
+One Gemini call per user message extracts BOTH:
+  * time-sensitive commitments (meetings, tasks, errands, deadlines)
+  * durable personal facts worth remembering long term
 
-Returns:
-    dict {content, remind_at (datetime)} if a future reminder was found
-    None otherwise
+Doing both in a single call halves our free-tier quota usage.
+
+Note there is deliberately no keyword pre-filter here. The old version
+required words like "tomorrow" or "meeting" to be present, which silently
+dropped things like "I need to submit the report by end of this week".
+Instead we only skip messages that are too short to carry any commitment.
 """
 import json
 import logging
-import asyncio
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from google import genai
 from google.genai import types as genai_types
-from config import GEMINI_API_KEY
+
+from agent.client import ANALYZE_MODELS, generate
 
 logger = logging.getLogger(__name__)
 
-_client = genai.Client(api_key=GEMINI_API_KEY)
-EXTRACTOR_MODEL = "gemini-3.5-flash"
+# Messages this short can't contain a commitment worth an API call.
+MIN_ANALYZE_LENGTH = 12
 
-# ── Extraction prompt ──────────────────────────────────────────────────────────
+# Chatter that clears the length bar but never carries intent.
+SKIP_EXACT = {
+    "ok", "okay", "k", "hi", "hey", "hello", "lol", "haha", "hmm", "yeah",
+    "yes", "no", "nope", "thanks", "thank you", "good night", "goodnight",
+    "good morning", "love you", "miss you", "bye", "sure",
+}
 
-EXTRACTOR_PROMPT = """
-You are a reminder extraction engine. Analyze the user message below and detect
-if it contains any reminder, alarm, task, or time-sensitive intent.
-
-Examples that SHOULD be extracted:
-- "remind me to call mom tomorrow at 6pm"
-- "I have a meeting on Friday at 3pm"
-- "don't let me forget to submit the report by Monday"
-- "wake me up at 7:30"
-- "my interview is tomorrow 10am"
-- "pay rent on the 5th"
-
-Examples that should NOT be extracted (general chat):
-- "I had a meeting yesterday"
-- "I usually wake up at 7"
-- "my birthday was last week"
+ANALYZE_PROMPT = """
+You extract structured data from a chat message. You never write prose.
 
 Current datetime: {now}
 User timezone: {timezone}
+User's name: {user_name}
 
-User message: "{message}"
+Recent conversation (for context — resolve references like "that" or "it"):
+{history}
 
-Respond ONLY with a valid JSON object — no explanation, no markdown, no code fences.
+Latest user message: "{message}"
 
-If a reminder is found:
+--- TASK 1: COMMITMENTS ---
+Find anything the user has to DO or ATTEND at a future time. Include things
+stated indirectly — a commitment does not need the word "remind".
+
+Extract these:
+- "tomorrow I have a meeting at 11am and I have to present"  -> event
+- "mom asked me to go to the bank, I have to go tomorrow"    -> task
+- "I need to submit the report by end of this week"          -> task
+- "my interview is on Friday 10am"                           -> event
+- "pay rent on the 5th"                                      -> task
+
+Do NOT extract:
+- Things already finished ("I had a meeting yesterday")
+- Habits or generalities ("I usually wake up at 7")
+- Hypotheticals ("I might go out sometime")
+
+Rules for timing:
+- "event" = a fixed appointment the user attends at a specific time.
+- "task"  = something to get done, where the time is a deadline or a rough slot.
+- If only a day is given with no clock time, use 09:00 in the user's timezone
+  and set "all_day": true.
+- "end of the week" means Friday. "this weekend" means Saturday morning.
+- Always output event_at as an ISO8601 datetime in UTC ending with Z.
+- Never output a time in the past.
+
+--- TASK 2: FACTS ---
+Pull out durable personal facts worth remembering for months: their job,
+studies, family and friends' names, home city, hobbies, health, preferences,
+important dates, ongoing goals.
+
+Do NOT store: passing moods, one-off plans, anything already in the recent
+conversation above, or anything you would not still care about in a month.
+Write each fact as a short third-person statement, e.g. "Works as a backend
+developer at TCS" or "Mother's name is Lakshmi".
+
+--- OUTPUT ---
+Respond with ONLY this JSON object. No markdown, no code fences, no comments.
+
 {{
-  "has_reminder": true,
-  "content": "short description of what to remind",
-  "remind_at": "ISO8601 datetime string in UTC",
-  "original_time_phrase": "the time phrase from the message"
+  "commitments": [
+    {{
+      "content": "short imperative description, e.g. 'Present at the team meeting'",
+      "event_at": "ISO8601 UTC ending in Z",
+      "kind": "event" or "task",
+      "all_day": true or false
+    }}
+  ],
+  "facts": ["short third-person fact", "..."]
 }}
 
-If no reminder is found:
-{{
-  "has_reminder": false
-}}
+Use empty arrays when there is nothing to extract.
 """.strip()
 
 
-# ── Main extractor ─────────────────────────────────────────────────────────────
-
-async def extract_reminder(message: str, profile: dict) -> dict | None:
-    """
-    Analyse a user message for reminder intent using Gemini.
-
-    Args:
-        message : Raw user message text
-        profile : User profile dict (used for timezone)
-
-    Returns:
-        dict {content: str, remind_at: datetime} if a future reminder found,
-        None otherwise.
-    """
-    # ── Pre-filter: skip Gemini call if message lacks time/reminder trigger words ──
-    lower_msg = message.lower()
-    trigger_words = (
-        "remind", "reminder", "alarm", "schedule", "alert", "notify",
-        "tomorrow", "tonight", "today", "yesterday",
-        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
-        "am", "pm", "o'clock", "meeting", "call", "appointment", "deadline", "wake me",
-        "at 1", "at 2", "at 3", "at 4", "at 5", "at 6", "at 7", "at 8", "at 9", "at 10", "at 11", "at 12"
-    )
-    if not any(word in lower_msg for word in trigger_words):
-        return None
-    tz_str = profile.get("timezone", "Asia/Kolkata")
+def _resolve_tz(profile: dict) -> ZoneInfo:
     try:
-        tz = ZoneInfo(tz_str)
+        return ZoneInfo(profile.get("timezone") or "Asia/Kolkata")
     except Exception:
-        tz = ZoneInfo("Asia/Kolkata")
+        return ZoneInfo("Asia/Kolkata")
 
-    now = datetime.now(tz).strftime("%A, %d %B %Y %I:%M %p %Z")
 
-    prompt = EXTRACTOR_PROMPT.format(
-        now=now,
-        timezone=tz_str,
-        message=message,
+def _format_history(history: list[dict], limit: int = 6) -> str:
+    """Render the tail of the conversation as plain text for the prompt."""
+    if not history:
+        return "(no earlier messages)"
+    recent = history[-limit:]
+    return "\n".join(
+        f"{'User' if m['role'] == 'user' else 'You'}: {m['content']}" for m in recent
+    )
+
+
+def _parse_json(raw: str) -> dict | None:
+    """Pull the first JSON object out of a model response."""
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        logger.warning(f"Analyzer response had no JSON object: {raw[:200]}")
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError as exc:
+        logger.warning(f"Analyzer returned invalid JSON: {exc}")
+        return None
+
+
+def _parse_commitment(item: dict, now_utc: datetime) -> dict | None:
+    """Validate one raw commitment dict into our internal shape, or drop it."""
+    raw_when = item.get("event_at")
+    content = (item.get("content") or "").strip()
+    if not raw_when or not content:
+        return None
+
+    try:
+        event_at = datetime.fromisoformat(str(raw_when).replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning(f"Analyzer gave an unparseable event_at: {raw_when!r}")
+        return None
+
+    if event_at.tzinfo is None:
+        event_at = event_at.replace(tzinfo=ZoneInfo("UTC"))
+
+    if event_at <= now_utc:
+        logger.info(f"Dropping commitment in the past: {content} @ {event_at}")
+        return None
+
+    kind = item.get("kind")
+    if kind not in ("event", "task"):
+        kind = "task"
+
+    return {
+        "content":  content[:200],
+        "event_at": event_at,
+        "kind":     kind,
+        "all_day":  bool(item.get("all_day")),
+    }
+
+
+async def analyze_message(
+    message: str,
+    profile: dict,
+    history: list[dict] | None = None,
+) -> dict:
+    """
+    Analyse a user message for commitments and durable facts.
+
+    Returns {"commitments": [...], "facts": [...]}, always — on any failure
+    it returns empty lists rather than raising, so chat is never blocked.
+    """
+    empty = {"commitments": [], "facts": []}
+
+    stripped = message.strip()
+    if len(stripped) < MIN_ANALYZE_LENGTH or stripped.lower().strip("!.? ") in SKIP_EXACT:
+        return empty
+
+    tz = _resolve_tz(profile)
+    prompt = ANALYZE_PROMPT.format(
+        now       = datetime.now(tz).strftime("%A, %d %B %Y %I:%M %p %Z"),
+        timezone  = str(tz),
+        user_name = profile.get("first_name", "the user"),
+        history   = _format_history(history or []),
+        message   = message,
     )
 
     config = genai_types.GenerateContentConfig(
         max_output_tokens=1024,
-        temperature=0.1,   # deterministic JSON output
+        temperature=0.1,          # deterministic JSON
+        response_mime_type="application/json",
     )
 
     try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: _client.models.generate_content(
-                model=EXTRACTOR_MODEL,
-                contents=prompt,
-                config=config,
-            ),
-        )
-
-        raw = response.text.strip() if response and response.text else ""
-        if not raw:
-            logger.warning("Extractor returned empty response")
-            return None
-
-        # Match JSON object pattern
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            raw = match.group(0)
-        else:
-            logger.warning(f"Extractor raw response has no JSON object: {raw}")
-            return None
-
-        data = json.loads(raw)
-
-        if not data.get("has_reminder"):
-            return None
-
-        remind_at_str = data.get("remind_at")
-        if not remind_at_str:
-            logger.warning("Extractor returned has_reminder=true but no remind_at")
-            return None
-
-        remind_at = datetime.fromisoformat(remind_at_str.replace("Z", "+00:00"))
-
-        # Ensure timezone-aware; assume UTC if naive
-        now_utc = datetime.now(ZoneInfo("UTC"))
-        if remind_at.tzinfo is None:
-            remind_at = remind_at.replace(tzinfo=ZoneInfo("UTC"))
-
-        # Skip reminders in the past
-        if remind_at <= now_utc:
-            logger.info(f"Extracted reminder is in the past — skipping: {remind_at}")
-            return None
-
-        return {
-            "content":   data.get("content", message[:100]),
-            "remind_at": remind_at,
-        }
-
-    except json.JSONDecodeError as exc:
-        logger.warning(f"Extractor returned non-JSON: {exc}")
-        return None
+        raw = await generate(prompt, config, ANALYZE_MODELS)
     except Exception as exc:
-        logger.warning(f"Reminder extraction error: {exc}")
-        return None
+        logger.warning(f"Message analysis failed: {exc}")
+        return empty
+
+    data = _parse_json(raw)
+    if not data:
+        return empty
+
+    now_utc = datetime.now(ZoneInfo("UTC"))
+
+    commitments = []
+    for item in data.get("commitments") or []:
+        if isinstance(item, dict):
+            parsed = _parse_commitment(item, now_utc)
+            if parsed:
+                commitments.append(parsed)
+
+    facts = [
+        str(f).strip()[:200]
+        for f in (data.get("facts") or [])
+        if isinstance(f, str) and f.strip()
+    ]
+
+    return {"commitments": commitments, "facts": facts}

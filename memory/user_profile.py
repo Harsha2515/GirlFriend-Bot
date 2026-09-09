@@ -140,3 +140,14 @@ async def remove_user_fact(user_id: int, fact: str) -> None:
         conn.commit()
 
     await asyncio.get_event_loop().run_in_executor(None, _remove)
+
+async def clear_user_facts(user_id: int) -> int:
+    """Delete every stored fact for a user (/facts clear). Returns count."""
+    def _clear():
+        conn = get_conn()
+        cur = conn.execute("DELETE FROM user_facts WHERE user_id = ?", (user_id,))
+        conn.commit()
+        logger.info(f"Cleared {cur.rowcount} facts for user {user_id}")
+        return cur.rowcount
+
+    return await asyncio.get_event_loop().run_in_executor(None, _clear)

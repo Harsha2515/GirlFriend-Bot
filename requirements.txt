@@ -1,14 +1,16 @@
-# Telegram bot framework (async, v21+)
+# Telegram bot framework (async)
 python-telegram-bot==21.10
 
-# Google Gemini (new SDK — gemini-2.0-flash)
+# Google Gemini — free tier, 1M tokens/day
 google-genai>=1.0.0
 
-# Load .env file
+# Loads .env
 python-dotenv>=1.0.0
 
 # Scheduler for timed reminders
 APScheduler==3.10.4
 
-# Timezone support
-pytz>=2024.1
+# Timezone database for zoneinfo. Ships with Linux but NOT with Windows,
+# and only arrives transitively via tzlocal otherwise — declare it directly
+# since every reminder time depends on it.
+tzdata>=2024.1

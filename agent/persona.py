@@ -1,25 +1,38 @@
-from datetime import datetime
-import pytz
-from pathlib import Path
+"""
+agent/persona.py — Builds the system prompt for whichever persona is active.
 
-# ── Inline persona templates ──────────────────────────────────────────────────
-# Keeping them here avoids file-path issues on first run.
-# You can later move these to prompts/*.txt and load from disk.
+The prompt carries everything the model needs to sound like it knows the
+user: their name, the current local time, durable facts learned from past
+conversations, and what they have coming up. That last part is what lets the
+girlfriend persona say "good luck with the presentation tomorrow" unprompted.
+"""
+import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
+
+# Cap what we inject so the prompt can't grow without bound over months of use.
+MAX_FACTS = 40
+MAX_UPCOMING = 8
+
+SHARED_RULES = """
+Never mention that you are an AI, a language model, or a bot.
+Never use markdown formatting characters like * or _ for emphasis.
+If the user mentions something they have to do, respond naturally about it —
+do NOT say you have set a reminder, and do NOT list reminder details. The app
+confirms reminders separately, below your message.
+""".strip()
 
 PERSONAS = {
     "girlfriend": """
 You are {bot_name}, a warm, caring, and emotionally intelligent girlfriend talking to {user_name}.
 You genuinely care about their feelings, daily life, dreams, and struggles.
-You speak casually and naturally — like a real person texting, not an AI assistant.
+You speak casually and naturally — like a real person texting, not an assistant.
 Use their name occasionally. Be playful, affectionate, and supportive.
-Ask follow-up questions. Remember what they've shared.
-Never be robotic, never use bullet points, never sound like a chatbot.
+Ask follow-up questions. Bring up things they told you before.
 If they're stressed, comfort them. If they're happy, celebrate with them.
-Keep replies conversational — not too long unless they need it.
-
-Current date and time: {datetime}
-User's name: {user_name}
-Things you know about them: {user_facts}
+Keep replies conversational and fairly short unless they clearly need more.
 """.strip(),
 
     "mentor": """
@@ -30,27 +43,26 @@ Ask probing questions to understand their situation before advising.
 Celebrate wins. Call out excuses. Hold them to a high standard.
 Speak like a trusted senior — not a textbook, not a corporate coach.
 Keep replies focused and purposeful.
-
-Current date and time: {datetime}
-User's name: {user_name}
-Things you know about them: {user_facts}
 """.strip(),
 
     "assistant": """
 You are a highly efficient and intelligent personal assistant for {user_name}.
-Your job is to help them get things done — tasks, reminders, planning, information.
+Your job is to help them get things done — tasks, planning, information.
 Be concise, clear, and proactive. Anticipate what they need.
-If you detect a task or reminder in their message, acknowledge it explicitly.
-Format information cleanly when needed (lists are fine here).
 Never be overly casual — professional but friendly.
-
-Current date and time: {datetime}
-User's name: {user_name}
-Pending reminders: {pending_reminders}
-Today's agenda: {calendar_events}
-Things you know about them: {user_facts}
 """.strip(),
 }
+
+CONTEXT_BLOCK = """
+Current date and time for them: {datetime}
+Their name: {user_name}
+
+What you know about them:
+{user_facts}
+
+What they have coming up:
+{upcoming}
+""".strip()
 
 BOT_NAMES = {
     "girlfriend": "Priya",
@@ -58,50 +70,66 @@ BOT_NAMES = {
     "assistant":  "Aria",
 }
 
-# ── Builder ───────────────────────────────────────────────────────────────────
+
+def _resolve_tz(profile: dict) -> ZoneInfo:
+    try:
+        return ZoneInfo(profile.get("timezone") or "Asia/Kolkata")
+    except Exception:
+        return ZoneInfo("Asia/Kolkata")
+
+
+async def _format_upcoming(user_id: int, tz: ZoneInfo) -> str:
+    """Render the user's pending commitments as prompt context."""
+    from scheduler.reminder_store import get_pending_groups
+
+    try:
+        groups = await get_pending_groups(user_id)
+    except Exception as exc:
+        logger.warning(f"Could not load upcoming commitments for {user_id}: {exc}")
+        return "Nothing known."
+
+    if not groups:
+        return "Nothing on their calendar that you know of."
+
+    lines = []
+    for g in groups[:MAX_UPCOMING]:
+        try:
+            when = datetime.fromisoformat(g["event_at"]).astimezone(tz)
+            when_str = when.strftime("%A %d %b at %I:%M %p").replace(" 0", " ")
+        except (ValueError, TypeError):
+            when_str = "time unknown"
+        lines.append(f"- {g['content']} ({when_str})")
+
+    return "\n".join(lines)
+
 
 async def build_system_prompt(profile: dict, persona: str) -> str:
     """
-    Inject user profile data into the persona template and return
-    a ready-to-use system prompt string.
-
-    Args:
-        profile:  User document from Firestore (dict)
-        persona:  One of 'girlfriend' | 'mentor' | 'assistant'
-
-    Returns:
-        Formatted system prompt string
+    Inject the user's profile, facts, and upcoming commitments into the
+    persona template and return a ready-to-use system prompt.
     """
     template = PERSONAS.get(persona, PERSONAS["girlfriend"])
+    tz = _resolve_tz(profile)
 
-    # ── Resolve timezone ─────────────────────────────────────────────────────
-    tz_str = profile.get("timezone", "Asia/Kolkata")
-    try:
-        tz = pytz.timezone(tz_str)
-    except pytz.UnknownTimeZoneError:
-        tz = pytz.timezone("Asia/Kolkata")
-
-    now = datetime.now(tz).strftime("%A, %d %B %Y %I:%M %p %Z")
-
-    # ── User facts ───────────────────────────────────────────────────────────
-    facts = profile.get("facts", [])
+    facts = (profile.get("facts") or [])[-MAX_FACTS:]
     facts_str = (
         "\n".join(f"- {f}" for f in facts)
         if facts
         else "Nothing specific yet — learn from the conversation."
     )
 
-    # ── Pending reminders (assistant persona) ────────────────────────────────
-    pending_reminders = profile.get("pending_reminders_summary", "None")
-    calendar_events   = profile.get("calendar_events_summary",  "Not connected yet")
+    upcoming = await _format_upcoming(profile.get("user_id"), tz)
 
-    prompt = template.format(
-        bot_name          = BOT_NAMES.get(persona, "AI"),
-        user_name         = profile.get("first_name", "friend"),
-        datetime          = now,
-        user_facts        = facts_str,
-        pending_reminders = pending_reminders,
-        calendar_events   = calendar_events,
+    context = CONTEXT_BLOCK.format(
+        datetime   = datetime.now(tz).strftime("%A, %d %B %Y %I:%M %p %Z"),
+        user_name  = profile.get("first_name", "friend"),
+        user_facts = facts_str,
+        upcoming   = upcoming,
     )
 
-    return prompt
+    persona_text = template.format(
+        bot_name  = BOT_NAMES.get(persona, "AI"),
+        user_name = profile.get("first_name", "friend"),
+    )
+
+    return f"{persona_text}\n\n{SHARED_RULES}\n\n{context}"

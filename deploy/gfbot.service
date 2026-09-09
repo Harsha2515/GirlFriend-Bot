@@ -1,0 +1,44 @@
+[Unit]
+Description=GirlFriend Telegram Bot
+Documentation=https://github.com/Harsha2515/GirlFriend-Bot
+# Wait for the network so the first Telegram poll doesn't fail on boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+
+# config.py loads .env from WorkingDirectory, so secrets stay in the file
+# rather than in this unit (which is world-readable in /etc/systemd/system).
+ExecStart=__APP_DIR__/venv/bin/python main.py
+
+# Unbuffered output so logs reach journalctl immediately instead of sitting
+# in a pipe buffer for minutes.
+Environment=PYTHONUNBUFFERED=1
+
+# Restart on any exit, including a clean one. A companion bot that quietly
+# stops is worse than one that loops -- reminders depend on the process
+# being alive at the scheduled minute.
+Restart=always
+RestartSec=10
+
+# If it crash-loops, back off instead of hammering Telegram's API:
+# more than 5 restarts in 5 minutes stops the unit until manually started.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gfbot
+
+# Light hardening -- the bot only needs its own directory and outbound HTTPS.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=__APP_DIR__
+
+[Install]
+WantedBy=multi-user.target
