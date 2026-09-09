@@ -2,10 +2,20 @@
 .env
 firebase_key.json
 
-# SQLite database (all user data lives here)
+# SQLite database (all user data lives here).
+# WAL mode creates -wal and -shm sidecar files that '*.db' does NOT match,
+# so they need listing explicitly or `git add -A` will sweep them in.
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# Local database backups
+backups/
 
 # Python cache
 __pycache__/
