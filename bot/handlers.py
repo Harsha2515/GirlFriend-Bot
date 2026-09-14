@@ -2,31 +2,38 @@
 bot/handlers.py — Core message handler for the Telegram bot.
 
 Flow for every incoming text message:
-  1. Load or auto-create the user profile
-  2. Handle persona-picker keyboard responses
-  3. Build conversation context from SQLite
-  4. Call Gemini for the reply AND analyse the message for commitments/facts,
+  1. Access control (approved / pending / blocked)
+  2. Onboarding: gender answer, persona buttons, or ask for gender if unknown
+  3. Free-tier guards (per-user and global daily limits)
+  4. Build conversation context from SQLite
+  5. Call Gemini for the reply AND analyse the message for commitments/facts,
      both at the same time so the analysis costs no extra latency
-  5. Schedule any commitments and tell the user about them in the same reply
-  6. Persist both turns and any newly learned facts
+  6. Schedule any commitments and tell the user about them in the same reply
+  7. Persist both turns and any newly learned facts
 """
 import asyncio
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Update, ReplyKeyboardRemove
+from telegram import Update
 from telegram.ext import ContextTypes
 
 from agent.extractor import analyze_message
 from agent.llm import call_llm
 from agent.persona import build_system_prompt
+from bot.onboarding import (
+    PERSONA_BUTTON_MAP,
+    apply_gender,
+    apply_persona,
+    ask_gender,
+    parse_gender,
+)
 from config import ADMIN_USER_ID, AUTO_APPROVE_LIMIT
 from memory.context import get_context, save_message, trim_to_budget
 from memory.usage import check_limits, record_message
 from memory.user_profile import (
     add_user_fact,
-    create_or_update_user,
     get_user,
     register_user,
 )
@@ -34,19 +41,6 @@ from scheduler.jobs import schedule_commitment
 from scheduler.reminder_store import has_similar_pending
 
 logger = logging.getLogger(__name__)
-
-# Keyboard button text -> persona slug
-PERSONA_BUTTON_MAP = {
-    "💕 girlfriend": "girlfriend",
-    "🎓 mentor":     "mentor",
-    "🗂 assistant":  "assistant",
-}
-
-PERSONA_INTROS = {
-    "girlfriend": "💕 Hey babe! What's on your mind?",
-    "mentor":     "🎓 Good — let's get focused. What are you working on?",
-    "assistant":  "🗂 Ready. What do you need?",
-}
 
 
 def _resolve_tz(profile: dict) -> ZoneInfo:
@@ -194,21 +188,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _handle_unapproved(update, context, user, status)
         return
 
-    # ── 2. Free-tier guards ──────────────────────────────────────────────────
+    profile = await get_user(tg_id)
+
+    # ── 2. Onboarding buttons and the gender question ─────────────────────────
+    # All of this happens before the free-tier guards: none of it calls Gemini,
+    # and a user who has hit their daily cap must still be able to set up or
+    # switch personas.
+    awaiting_gender = not profile.get("gender")
+
+    gender = parse_gender(user_text, awaiting=awaiting_gender)
+    if gender:
+        await apply_gender(update.message, tg_id, gender)
+        return
+
+    if user_text.lower() in PERSONA_BUTTON_MAP:
+        await apply_persona(update.message, tg_id, PERSONA_BUTTON_MAP[user_text.lower()])
+        return
+
+    if awaiting_gender:
+        # Ask before the first reply, so the very first message comes from the
+        # right partner. The message itself isn't stored or charged against
+        # quota -- nothing has been sent to the model yet.
+        await ask_gender(update.message, profile.get("first_name"))
+        return
+
+    # ── 3. Free-tier guards ──────────────────────────────────────────────────
     allowed, reason = await check_limits(tg_id, is_admin=tg_id == ADMIN_USER_ID)
     if not allowed:
         await update.message.reply_text(reason)
-        return
-
-    profile = await get_user(tg_id)
-
-    # ── 3. Handle persona-picker keyboard replies ─────────────────────────────
-    if user_text.lower() in PERSONA_BUTTON_MAP:
-        persona = PERSONA_BUTTON_MAP[user_text.lower()]
-        await create_or_update_user(user_id=tg_id, active_persona=persona)
-        await update.message.reply_text(
-            PERSONA_INTROS[persona], reply_markup=ReplyKeyboardRemove()
-        )
         return
 
     # ── 4. Build conversation context ─────────────────────────────────────────

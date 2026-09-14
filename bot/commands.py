@@ -1,8 +1,10 @@
 """
 bot/commands.py — All slash command handlers.
 
-  /start     — Onboard new user, show persona picker
-  /mode      — Switch persona
+  /start     — Onboard: ask gender, then start the matching partner persona
+  /switch    — Swap between Girlfriend and Boyfriend
+  /gender    — Change your gender (resets to the matching partner)
+  /mode      — Pick any persona, including Mentor and Assistant
   /name      — Set preferred name
   /timezone  — Set your timezone (reminders depend on it)
   /reminders — List upcoming commitments
@@ -19,9 +21,18 @@ from datetime import datetime
 from functools import wraps
 from zoneinfo import ZoneInfo, available_timezones
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import ContextTypes
 
+from agent.persona import BOT_NAMES, PARTNER_PERSONAS
+from bot.onboarding import (
+    MODE_KEYBOARD,
+    PARTNER_KEYBOARD,
+    VALID_MODES,
+    apply_persona,
+    ask_gender,
+    keyboard,
+)
 from config import (
     ADMIN_USER_ID,
     AUTO_APPROVE_LIMIT,
@@ -45,15 +56,11 @@ from scheduler.reminder_store import cancel_group, get_pending_groups
 
 logger = logging.getLogger(__name__)
 
-PERSONA_KEYBOARD = [["💕 Girlfriend", "🎓 Mentor", "🗂 Assistant"]]
-
-VALID_MODES = {
-    "girlfriend":    "girlfriend",
-    "mentor":        "mentor",
-    "assistant":     "assistant",
-    "💕 girlfriend": "girlfriend",
-    "🎓 mentor":     "mentor",
-    "🗂 assistant":  "assistant",
+PERSONA_LABELS = {
+    "girlfriend": f"💕 Girlfriend ({BOT_NAMES['girlfriend']})",
+    "boyfriend":  f"💙 Boyfriend ({BOT_NAMES['boyfriend']})",
+    "mentor":     "🎓 Mentor",
+    "assistant":  "🗂 Assistant",
 }
 
 
@@ -90,54 +97,98 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    reply_markup = ReplyKeyboardMarkup(
-        PERSONA_KEYBOARD, one_time_keyboard=True, resize_keyboard=True
+    profile = await get_user(user.id) or {}
+
+    # New users, and anyone who predates the gender question, are asked first.
+    # The answer arrives as an ordinary message and is handled in handlers.py.
+    if not profile.get("gender"):
+        await ask_gender(update.message, user.first_name)
+        return
+
+    current = profile.get("active_persona") or "girlfriend"
+    await update.message.reply_text(
+        f"Welcome back, {profile.get('first_name') or user.first_name}! 👋\n\n"
+        f"You're chatting with: {PERSONA_LABELS.get(current, current)}\n\n"
+        "Anything you mention having to do gets picked up automatically. Say "
+        "\"tomorrow I have a meeting at 11\" and you'll get a nudge the night "
+        "before and an hour ahead.\n\n"
+        "/switch — swap Girlfriend ↔ Boyfriend\n"
+        "/mode — Mentor or Assistant\n"
+        "/help — everything else",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
-    await update.message.reply_text(
-        f"Hey {user.first_name}! 👋 I'm your AI companion.\n\n"
-        "I can be your girlfriend, mentor, or personal assistant — pick a mode "
-        "and just start chatting.\n\n"
-        "Anything you mention having to do gets picked up automatically. Say "
-        "\"tomorrow I have a meeting at 11\" and I'll nudge you the night "
-        "before and an hour ahead.\n\n"
-        "Reminders use Asia/Kolkata time by default — change it any time with "
-        "/timezone.\n\n"
-        "Which persona would you like to start with?",
-        reply_markup=reply_markup,
-    )
+
+# ── /switch ───────────────────────────────────────────────────────────────────
+
+async def switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Swap partner persona.
+
+      /switch             — flip Girlfriend ↔ Boyfriend
+      /switch boyfriend   — pick one explicitly
+
+    From Mentor or Assistant, a bare /switch shows the two partner buttons,
+    since there's no obvious "other one" to flip to.
+    """
+    tg_id = update.effective_user.id
+    profile = await get_user(tg_id) or {}
+    current = profile.get("active_persona") or "girlfriend"
+
+    if context.args:
+        persona = VALID_MODES.get(" ".join(context.args).lower().strip())
+        if persona not in PARTNER_PERSONAS:
+            await update.message.reply_text(
+                "❌ Use: /switch girlfriend  or  /switch boyfriend\n"
+                "(For Mentor or Assistant, use /mode.)"
+            )
+            return
+    elif current == "girlfriend":
+        persona = "boyfriend"
+    elif current == "boyfriend":
+        persona = "girlfriend"
+    else:
+        await update.message.reply_text(
+            "Who would you like to talk to? 👇",
+            reply_markup=keyboard(PARTNER_KEYBOARD),
+        )
+        return
+
+    if persona == current:
+        await update.message.reply_text(
+            f"You're already chatting with {PERSONA_LABELS[persona]} 😊"
+        )
+        return
+
+    await apply_persona(update.message, tg_id, persona)
+
+
+# ── /gender ───────────────────────────────────────────────────────────────────
+
+async def gender_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-ask gender. Answering resets the partner persona to match."""
+    profile = await get_user(update.effective_user.id) or {}
+    await ask_gender(update.message, profile.get("first_name"), changing=True)
 
 
 # ── /mode ─────────────────────────────────────────────────────────────────────
 
 async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Switch active persona. Usage: /mode girlfriend | mentor | assistant"""
+    """Pick any persona. Usage: /mode girlfriend | boyfriend | mentor | assistant"""
     if not context.args:
-        reply_markup = ReplyKeyboardMarkup(
-            PERSONA_KEYBOARD, one_time_keyboard=True, resize_keyboard=True
-        )
         await update.message.reply_text(
-            "Which persona do you want?", reply_markup=reply_markup
+            "Which persona do you want?", reply_markup=keyboard(MODE_KEYBOARD)
         )
         return
 
     persona = VALID_MODES.get(" ".join(context.args).lower().strip())
     if not persona:
         await update.message.reply_text(
-            "❌ Unknown mode. Use: /mode girlfriend | mentor | assistant"
+            "❌ Unknown mode. Use: /mode girlfriend | boyfriend | mentor | assistant"
         )
         return
 
-    await create_or_update_user(user_id=update.effective_user.id, active_persona=persona)
-
-    intros = {
-        "girlfriend": "💕 Switched to Girlfriend mode. Hey babe, what's on your mind?",
-        "mentor":     "🎓 Switched to Mentor mode. Let's get to work — what are you on?",
-        "assistant":  "🗂 Switched to Assistant mode. I'm ready. What do you need?",
-    }
-    await update.message.reply_text(
-        intros[persona], reply_markup=ReplyKeyboardRemove()
-    )
+    await apply_persona(update.message, update.effective_user.id, persona)
 
 
 # ── /name ─────────────────────────────────────────────────────────────────────
@@ -293,8 +344,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Send the full command reference."""
     await update.message.reply_text(
         "🤖 AI Companion Bot — Commands\n\n"
-        "/start — Onboarding & persona selection\n"
-        "/mode [girlfriend|mentor|assistant] — Switch persona\n"
+        "/start — Onboarding\n"
+        "/switch — Swap Girlfriend ↔ Boyfriend\n"
+        "/gender — Change your gender\n"
+        "/mode [girlfriend|boyfriend|mentor|assistant] — Pick any persona\n"
         "/name <your name> — Set your preferred name\n"
         "/timezone <Area/City> — Set your timezone\n"
         "/reminders — List upcoming commitments\n"

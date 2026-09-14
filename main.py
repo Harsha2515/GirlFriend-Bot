@@ -30,12 +30,14 @@ from bot.commands import (
     deny,
     facts_command,
     forget,
+    gender_command,
     help_command,
     mode,
     name_command,
     pending,
     reminders,
     start,
+    switch,
     timezone_command,
     usage_command,
     users_command,
@@ -148,6 +150,8 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("switch",    switch))
+    app.add_handler(CommandHandler("gender",    gender_command))
     app.add_handler(CommandHandler("mode",      mode))
     app.add_handler(CommandHandler("name",      name_command))
     app.add_handler(CommandHandler("timezone",  timezone_command))

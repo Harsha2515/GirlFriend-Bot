@@ -1,8 +1,8 @@
 # 💕 GirlFriend Bot
 
 > A Telegram AI companion powered by **Google Gemini Flash** (free tier).
-> Three personas — **Girlfriend**, **Mentor**, **Assistant** — with persistent
-> memory and reminders that pick themselves up out of normal conversation.
+> Four personas — **Girlfriend**, **Boyfriend**, **Mentor**, **Assistant** — with
+> persistent memory and reminders that pick themselves up out of normal conversation.
 
 ---
 
@@ -62,7 +62,7 @@ python validate.py    # offline sanity check, makes no API calls
 python main.py
 ```
 
-Open Telegram, send `/start`, pick a persona. Done 🎉
+Open Telegram, send `/start`, tell it whether you're male or female. Done 🎉
 
 ---
 
@@ -70,8 +70,10 @@ Open Telegram, send `/start`, pick a persona. Done 🎉
 
 | Command | Description |
 |---|---|
-| `/start` | Onboarding + persona picker |
-| `/mode girlfriend\|mentor\|assistant` | Switch persona |
+| `/start` | Onboarding — asks your gender, then starts the matching partner |
+| `/switch` | Swap Girlfriend ↔ Boyfriend (`/switch boyfriend` to pick one) |
+| `/gender` | Change your gender; resets to the matching partner |
+| `/mode girlfriend\|boyfriend\|mentor\|assistant` | Pick any persona |
 | `/name <name>` | Set your preferred name |
 | `/timezone <Area/City>` | Set your timezone (`/tz` also works) |
 | `/reminders` | List upcoming commitments |
@@ -99,8 +101,15 @@ Open Telegram, send `/start`, pick a persona. Done 🎉
 | Persona | Name | Personality |
 |---|---|---|
 | 💕 Girlfriend | Priya | Warm, caring, emotionally intelligent |
+| 💙 Boyfriend | Arjun | Warm, dependable, listens before fixing |
 | 🎓 Mentor | Coach | Direct, sharp, pushes you to grow |
 | 🗂 Assistant | Aria | Efficient, concise, task-focused |
+
+**Who you start with.** On first contact the bot asks whether you're male or
+female: male starts with the Girlfriend, female with the Boyfriend. That's only
+the starting point — `/switch` swaps partners any time, and `/mode` reaches
+Mentor and Assistant. Users who joined before this existed are asked once, on
+their next message; their chats, facts, and reminders are untouched.
 
 ---
 
@@ -146,14 +155,13 @@ without losing anything.
 │
 ├── bot/
 │   ├── handlers.py           # Main message handler
-│   └── commands.py           # All /commands
+│   ├── commands.py           # All /commands
+│   └── onboarding.py         # Gender question, partner assignment, /switch
 │
 ├── memory/
 │   ├── models.py             # SQLite schema + migrations
 │   ├── context.py            # Conversation history
-│   └── user_profile.py       # Profile + long-term facts
-│
-├── memory/
+│   ├── user_profile.py       # Profile + long-term facts
 │   └── usage.py              # Daily counters + free-tier guards
 │
 ├── scheduler/

@@ -109,6 +109,14 @@ def _migrate_users(conn: sqlite3.Connection) -> None:
     if "requested_at" not in columns:
         conn.execute("ALTER TABLE users ADD COLUMN requested_at TEXT")
 
+    # 'male' | 'female' | NULL. NULL means "not asked yet", which is exactly
+    # the state every pre-existing user should be in: they get asked once on
+    # their next message, and nothing about their history changes. ADD COLUMN
+    # is purely additive -- no rows are rewritten or dropped.
+    if "gender" not in columns:
+        logger.info("Adding gender column to users table...")
+        conn.execute("ALTER TABLE users ADD COLUMN gender TEXT")
+
 
 def init_db() -> None:
     """Create all tables if they don't exist, then apply migrations."""

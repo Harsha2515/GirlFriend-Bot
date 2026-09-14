@@ -47,6 +47,7 @@ async def create_or_update_user(
     first_name: str = None,
     active_persona: str = None,
     timezone: str = None,
+    gender: str = None,
 ) -> None:
     """
     INSERT or UPDATE a user record.
@@ -81,6 +82,7 @@ async def create_or_update_user(
             if first_name     is not None: fields.append("first_name = ?");     values.append(first_name)
             if active_persona is not None: fields.append("active_persona = ?"); values.append(active_persona)
             if timezone       is not None: fields.append("timezone = ?");       values.append(timezone)
+            if gender         is not None: fields.append("gender = ?");         values.append(gender)
 
             if fields:
                 values.append(user_id)

@@ -49,6 +49,11 @@ def _db():
     missing = required - cols
     if missing:
         raise AssertionError(f"reminders table is missing columns: {missing}")
+
+    user_cols = {c["name"] for c in conn.execute("PRAGMA table_info(users)")}
+    missing = {"status", "gender"} - user_cols
+    if missing:
+        raise AssertionError(f"users table is missing columns: {missing}")
     return f"tables={sorted(tables)}"
 
 
@@ -70,6 +75,26 @@ check("scheduler.reminder_store",
 check("scheduler.jobs", lambda: __import__("scheduler.jobs", fromlist=["restore_pending"]) and "")
 check("bot.handlers",   lambda: __import__("bot.handlers", fromlist=["handle_message"]) and "")
 check("bot.commands",   lambda: __import__("bot.commands", fromlist=["timezone_command"]) and "")
+
+
+def _partners():
+    from agent.persona import BOT_NAMES, PARTNER_FOR_GENDER, PERSONAS
+    from bot.onboarding import PERSONA_INTROS, parse_gender
+
+    for persona in ("girlfriend", "boyfriend"):
+        assert persona in PERSONAS, f"missing persona prompt: {persona}"
+        assert persona in BOT_NAMES and persona in PERSONA_INTROS, f"incomplete: {persona}"
+    assert PARTNER_FOR_GENDER == {"male": "girlfriend", "female": "boyfriend"}
+
+    # Buttons always count; bare words only while we're waiting for an answer.
+    assert parse_gender("👩 Female", awaiting=False) == "female"
+    assert parse_gender("female", awaiting=True) == "female"
+    assert parse_gender("female", awaiting=False) is None, "plain word re-set gender mid-chat"
+    assert parse_gender("my boss is female", awaiting=True) is None
+    return "male -> girlfriend, female -> boyfriend"
+
+
+check("partner personas", _partners)
 
 
 # ── Reminder planning logic ───────────────────────────────────────────────────
