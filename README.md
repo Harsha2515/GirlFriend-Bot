@@ -1,4 +1,4 @@
-# 💕 GirlFriend Bot
+# 💕 GirlFriend & 💙 BoyFriend Bot
 
 > A Telegram AI companion powered by **Google Gemini Flash** (free tier).
 > Four personas — **Girlfriend**, **Boyfriend**, **Mentor**, **Assistant** — with
@@ -8,6 +8,9 @@
 
 ## What makes it different
 
+It starts by asking one question — *"Are you male or female?"* — and becomes
+your girlfriend (**Priya**) or boyfriend (**Arjun**). Switch any time with `/switch`.
+
 You don't tell it to set a reminder. You just talk:
 
 > **You:** hey, tomorrow I have a meeting at 11 AM and I have to present the Q3 numbers
@@ -16,6 +19,16 @@ You don't tell it to set a reminder. You just talk:
 > go crush it? 💕
 >
 > 📌 Meeting and present Q3 numbers — tomorrow at 11:00 AM — I'll nudge you tonight too
+
+Or, with the Boyfriend persona:
+
+> **You:** tomorrow I have a presentation at 11 and I'm really nervous
+>
+> **Arjun:** Hey, come here. It's totally okay to feel nervous — that just means you
+> care about doing well. Do you want to talk through it, or would you rather just vent
+> for a bit? I'm right here either way. 💙
+>
+> 📌 Presentation — tomorrow at 11:00 AM — I'll nudge you tonight too
 
 Then it actually shows up:
 
@@ -299,6 +312,26 @@ so history never slows the bot down or costs more as it grows. Older rows are
 kept purely so you can read them, and pruned nightly to
 `MESSAGE_RETENTION_PER_USER` (default 400). Measured growth is ~349 bytes per
 message — about 49 MB/year for 10 active users, against a 47 GB disk.
+
+**Inactive users are deleted.** Anyone who hasn't interacted with the bot for
+`INACTIVE_USER_DAYS` (default **75**) is removed nightly at 03:30 UTC, along
+with all their chats, facts, reminders and usage counters. "Interacted" means
+anything at all — a message, a command, or a button tap — tracked in
+`users.last_seen_at`. If they come back, they're treated exactly like a new
+user: approval gate, gender question, and no memory of the old conversation.
+
+Three kinds of user are never deleted:
+
+| Kept | Why |
+|---|---|
+| Blocked users | Otherwise a blocked person could wait 75 days and return unblocked |
+| The admin (`ADMIN_USER_ID`) | You can't lock yourself out of your own bot |
+| Anyone with a pending reminder | Someone who set a reminder months ahead hasn't left; they become eligible once it's delivered |
+
+Deletions free up auto-approve slots, so a returning user may be approved
+automatically or land in `/pending`, depending on how full the limit is. Note
+that nightly backups keep deleted data for up to 14 more days until they rotate
+out. Set `INACTIVE_USER_DAYS=0` to turn the cleanup off.
 
 ---
 

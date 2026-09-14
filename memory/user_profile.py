@@ -279,3 +279,98 @@ async def list_users(status: str | None = None, limit: int = 100) -> list[dict]:
         return [dict(r) for r in rows]
 
     return await asyncio.get_event_loop().run_in_executor(None, _list)
+
+
+# ── Activity tracking & inactive-user cleanup ─────────────────────────────────
+
+async def touch_last_seen(user_id: int) -> None:
+    """
+    Record that this user just interacted with the bot.
+
+    Called for every incoming update, so it is throttled to one write per hour
+    per user: the cleanup works in days, and there's no reason to rewrite the
+    row on every message. Unknown users are ignored -- registration creates
+    them, and their created_at stands in until the first touch.
+    """
+    def _touch():
+        conn = get_conn()
+        conn.execute(
+            """
+            UPDATE users SET last_seen_at = datetime('now')
+            WHERE user_id = ?
+              AND (last_seen_at IS NULL OR last_seen_at < datetime('now', '-1 hour'))
+            """,
+            (user_id,),
+        )
+        conn.commit()
+
+    await asyncio.get_event_loop().run_in_executor(None, _touch)
+
+
+# Tables holding per-user rows, in the order they must be emptied. Children
+# first: they reference users(user_id) and foreign keys are enforced, so the
+# users row can only go once nothing points at it.
+_USER_DATA_TABLES = ("messages", "user_facts", "reminders", "usage_daily")
+
+
+async def purge_inactive_users(days: int, protected_ids: tuple[int, ...] = ()) -> list[int]:
+    """
+    Delete users who haven't interacted in `days` days, with all their data.
+
+    A deleted user who comes back is indistinguishable from a brand-new one:
+    they go through approval, get asked their gender again, and the bot has no
+    memory of them.
+
+    Never deleted:
+      * blocked users -- deleting them would let a blocked person wait out
+        the window and return unblocked
+      * anyone in `protected_ids` (the admin)
+      * users with a reminder still pending -- someone who set a reminder for
+        three months out hasn't left; they become eligible once it's delivered
+
+    Each user is removed in its own transaction, so a failure part-way through
+    can never leave half a user behind. Returns the IDs that were deleted.
+    A `days` value <= 0 disables the cleanup entirely.
+    """
+    if days <= 0:
+        return []
+
+    def _purge():
+        conn = get_conn()
+        placeholders = ",".join("?" * len(protected_ids)) or "NULL"
+        candidates = [
+            r["user_id"]
+            for r in conn.execute(
+                f"""
+                SELECT u.user_id FROM users u
+                WHERE COALESCE(u.last_seen_at, u.created_at) < datetime('now', ?)
+                  AND u.status != 'blocked'
+                  AND u.user_id NOT IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM reminders r
+                      WHERE r.user_id = u.user_id AND r.status = 'pending'
+                  )
+                """,
+                (f"-{days} days", *protected_ids),
+            )
+        ]
+
+        deleted = []
+        for user_id in candidates:
+            try:
+                with conn:   # one transaction per user: all-or-nothing
+                    for table in _USER_DATA_TABLES:
+                        conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+                    conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+                deleted.append(user_id)
+            except Exception as exc:
+                logger.error(f"Could not purge inactive user {user_id}: {exc}")
+
+        if deleted:
+            conn.execute("VACUUM")   # actually release the freed space
+            logger.info(
+                f"Purged {len(deleted)} user(s) inactive for {days}+ days: {deleted}"
+            )
+        return deleted
+
+    return await asyncio.get_event_loop().run_in_executor(None, _purge)

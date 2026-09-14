@@ -117,6 +117,27 @@ def _migrate_users(conn: sqlite3.Connection) -> None:
         logger.info("Adding gender column to users table...")
         conn.execute("ALTER TABLE users ADD COLUMN gender TEXT")
 
+    # When the user last did anything at all -- message, command, or button.
+    # Drives the inactive-user cleanup. Stored in SQLite's datetime('now')
+    # format ('YYYY-MM-DD HH:MM:SS', UTC) to match created_at, so the two
+    # compare correctly as text.
+    if "last_seen_at" not in columns:
+        logger.info("Adding last_seen_at column to users table...")
+        conn.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
+        # Backfill from the best evidence we have: their latest stored
+        # message, else when they joined. Without this every existing user
+        # would look brand new -- or, worse, fall back to created_at and look
+        # older than they really are.
+        conn.execute(
+            """
+            UPDATE users
+            SET last_seen_at = COALESCE(
+                (SELECT MAX(m.created_at) FROM messages m WHERE m.user_id = users.user_id),
+                created_at
+            )
+            """
+        )
+
 
 def init_db() -> None:
     """Create all tables if they don't exist, then apply migrations."""

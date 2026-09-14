@@ -51,7 +51,7 @@ def _db():
         raise AssertionError(f"reminders table is missing columns: {missing}")
 
     user_cols = {c["name"] for c in conn.execute("PRAGMA table_info(users)")}
-    missing = {"status", "gender"} - user_cols
+    missing = {"status", "gender", "last_seen_at"} - user_cols
     if missing:
         raise AssertionError(f"users table is missing columns: {missing}")
     return f"tables={sorted(tables)}"

@@ -15,11 +15,14 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+from telegram import Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -44,10 +47,16 @@ from bot.commands import (
     whoami,
 )
 from bot.handlers import handle_message, error_handler
-from config import ADMIN_USER_ID, MESSAGE_RETENTION_PER_USER, TELEGRAM_BOT_TOKEN
+from config import (
+    ADMIN_USER_ID,
+    INACTIVE_USER_DAYS,
+    MESSAGE_RETENTION_PER_USER,
+    TELEGRAM_BOT_TOKEN,
+)
 from memory.context import prune_old_messages
 from memory.models import init_db
 from memory.usage import prune_usage
+from memory.user_profile import purge_inactive_users, touch_last_seen
 from scheduler.jobs import init_scheduler, restore_pending
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -124,13 +133,38 @@ async def post_init(application: Application) -> None:
 
 
 async def _nightly_maintenance() -> None:
-    """Trim message history and old usage counters."""
+    """Remove inactive users, then trim message history and old usage counters."""
+    # Each step is isolated so one failure doesn't skip the others.
+    try:
+        protected = (ADMIN_USER_ID,) if ADMIN_USER_ID else ()
+        purged = await purge_inactive_users(INACTIVE_USER_DAYS, protected_ids=protected)
+        logger.info(f"Nightly maintenance: {len(purged)} inactive user(s) removed.")
+    except Exception as exc:
+        logger.error(f"Inactive-user cleanup failed: {exc}")
+
     try:
         pruned = await prune_old_messages(MESSAGE_RETENTION_PER_USER)
         rows = await prune_usage(keep_days=90)
         logger.info(f"Nightly maintenance: {pruned} messages, {rows} usage rows pruned.")
     except Exception as exc:
         logger.error(f"Nightly maintenance failed: {exc}")
+
+
+async def _track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Stamp last_seen_at for whoever sent this update, before any handler runs.
+
+    Registered in group -1 so it sees every message, command and button tap --
+    not just chats that reach Gemini. It never blocks or replies, and a failure
+    here must never stop the real handlers from running.
+    """
+    user = update.effective_user
+    if user is None:
+        return
+    try:
+        await touch_last_seen(user.id)
+    except Exception as exc:
+        logger.warning(f"Could not record activity for {user.id}: {exc}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -148,6 +182,9 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
+
+    # Group -1 runs before every other handler, for every update.
+    app.add_handler(TypeHandler(Update, _track_activity), group=-1)
 
     app.add_handler(CommandHandler("start",     start))
     app.add_handler(CommandHandler("switch",    switch))

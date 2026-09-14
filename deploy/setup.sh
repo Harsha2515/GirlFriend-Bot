@@ -92,6 +92,10 @@ GLOBAL_DAILY_API_LIMIT=1000
 
 # Messages kept per user (only the last 20 are ever sent to the model).
 MESSAGE_RETENTION_PER_USER=400
+
+# Delete users inactive this many days (with all their data). They start over
+# as new users if they return. Blocked users and the admin are kept. 0 = never.
+INACTIVE_USER_DAYS=75
 ENVEOF
     chmod 600 "$APP_DIR/.env"
     warn "Edit $APP_DIR/.env with your two keys, then re-run this script."

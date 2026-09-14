@@ -61,6 +61,12 @@ GLOBAL_DAILY_API_LIMIT: int = _int_env("GLOBAL_DAILY_API_LIMIT", 1000)
 # purpose beyond history you can read. Pruned nightly. 0 disables pruning.
 MESSAGE_RETENTION_PER_USER: int = _int_env("MESSAGE_RETENTION_PER_USER", 400)
 
+# Users who haven't interacted in this many days are deleted nightly, with all
+# their chats, facts and reminders. If they return they start over as a new
+# user. Blocked users, the admin, and anyone with a pending reminder are kept.
+# 0 disables the cleanup.
+INACTIVE_USER_DAYS: int = _int_env("INACTIVE_USER_DAYS", 75)
+
 # ── Runtime guards ────────────────────────────────────────────────────────────
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
