@@ -181,9 +181,6 @@ without losing anything.
 │   ├── jobs.py               # Lead-time planning, firing, restart recovery
 │   └── reminder_store.py     # Reminder CRUD + dedup
 │
-├── tools/
-│   └── chats.py              # Read stored conversations (read-only)
-│
 └── deploy/
     ├── setup.sh              # One-command VM provisioning
     ├── backup.sh             # Nightly SQLite snapshot
@@ -268,50 +265,11 @@ Set `GLOBAL_DAILY_API_LIMIT` below your key's real daily quota — check it at
 
 ---
 
-## Reading the stored chats
+## Data retention
 
-Everything lives in one SQLite file — `bot.db` — with four tables:
-
-| Table | Holds |
-|---|---|
-| `users` | One row per person: name, persona, timezone, access status |
-| `messages` | Every turn: `user_id`, `role` (user/assistant), `content`, timestamp |
-| `user_facts` | Durable facts learned about each person |
-| `reminders` | One row per nudge, grouped by `group_id` per commitment |
-
-`tools/chats.py` reads it without you writing SQL. It opens the database
-read-only, so it's safe to run while the bot is live:
-
-```bash
-python tools/chats.py stats               # overview: users, messages, usage
-python tools/chats.py users               # everyone, with message counts
-python tools/chats.py chat Priya          # one person's conversation
-python tools/chats.py chat @priya_k       # by username
-python tools/chats.py chat 987654321      # by Telegram ID
-python tools/chats.py chat Priya -n 100   # last 100 messages
-python tools/chats.py search "meeting"    # find messages by text
-python tools/chats.py facts Priya         # what it remembers about them
-python tools/chats.py reminders Priya
-python tools/chats.py export Priya        # dump one chat to a .txt file
-```
-
-You don't need to know anyone's Telegram ID — run `users` to see everyone, or
-just use their name. Names and usernames match case-insensitively and a prefix
-is enough; an ambiguous name lists the candidates rather than guessing.
-
-On the VM: `cd ~/GirlFriend-Bot && ./venv/bin/python tools/chats.py users`
-
-Raw SQL still works if you prefer it:
-
-```bash
-sqlite3 bot.db "SELECT role, content FROM messages WHERE user_id=123 ORDER BY id DESC LIMIT 20;"
-```
-
-**Retention.** Only the last 20 messages per user are ever sent to the model,
-so history never slows the bot down or costs more as it grows. Older rows are
-kept purely so you can read them, and pruned nightly to
-`MESSAGE_RETENTION_PER_USER` (default 400). Measured growth is ~349 bytes per
-message — about 49 MB/year for 10 active users, against a 47 GB disk.
+**Message history.** Only the last 20 messages per user are ever sent to the
+model, so a long history never slows the bot down or costs more. Older history
+is trimmed nightly to `MESSAGE_RETENTION_PER_USER` (default 400 per user).
 
 **Inactive users are deleted.** Anyone who hasn't interacted with the bot for
 `INACTIVE_USER_DAYS` (default **75**) is removed nightly at 03:30 UTC, along

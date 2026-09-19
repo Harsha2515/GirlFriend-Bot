@@ -43,3 +43,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Private admin guide (how to read chats, server access). Never commit.
+admin.md
