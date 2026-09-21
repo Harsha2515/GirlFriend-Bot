@@ -310,7 +310,7 @@ async def touch_last_seen(user_id: int) -> None:
 # Tables holding per-user rows, in the order they must be emptied. Children
 # first: they reference users(user_id) and foreign keys are enforced, so the
 # users row can only go once nothing points at it.
-_USER_DATA_TABLES = ("messages", "user_facts", "reminders", "usage_daily")
+_USER_DATA_TABLES = ("messages", "user_facts", "reminders", "usage_daily", "tool_usage_daily")
 
 
 async def purge_inactive_users(days: int, protected_ids: tuple[int, ...] = ()) -> list[int]:
@@ -337,7 +337,13 @@ async def purge_inactive_users(days: int, protected_ids: tuple[int, ...] = ()) -
 
     def _purge():
         conn = get_conn()
-        placeholders = ",".join("?" * len(protected_ids)) or "NULL"
+        # Only add the exclusion when there is something to exclude. An empty
+        # list must NOT become `NOT IN (NULL)`: in SQL that is never true, so
+        # it would silently match nobody and the cleanup would never run.
+        protected = tuple(i for i in protected_ids if i)
+        exclude = (
+            f"AND u.user_id NOT IN ({','.join('?' * len(protected))})" if protected else ""
+        )
         candidates = [
             r["user_id"]
             for r in conn.execute(
@@ -345,13 +351,13 @@ async def purge_inactive_users(days: int, protected_ids: tuple[int, ...] = ()) -
                 SELECT u.user_id FROM users u
                 WHERE COALESCE(u.last_seen_at, u.created_at) < datetime('now', ?)
                   AND u.status != 'blocked'
-                  AND u.user_id NOT IN ({placeholders})
+                  {exclude}
                   AND NOT EXISTS (
                       SELECT 1 FROM reminders r
                       WHERE r.user_id = u.user_id AND r.status = 'pending'
                   )
                 """,
-                (f"-{days} days", *protected_ids),
+                (f"-{days} days", *protected),
             )
         ]
 
@@ -374,3 +380,49 @@ async def purge_inactive_users(days: int, protected_ids: tuple[int, ...] = ()) -
         return deleted
 
     return await asyncio.get_event_loop().run_in_executor(None, _purge)
+
+
+# ── Location (for weather) ────────────────────────────────────────────────────
+
+# 2 decimal places is ~1.1 km: enough for a weather forecast, too coarse to
+# locate someone's home. Rounding happens here, at the single write path, so
+# precise coordinates can never reach the database.
+LOCATION_PRECISION = 2
+
+
+async def set_location(user_id: int, latitude: float, longitude: float, name: str) -> None:
+    """Save a user's (rounded) location and a human-readable place name."""
+    lat = round(float(latitude), LOCATION_PRECISION)
+    lon = round(float(longitude), LOCATION_PRECISION)
+
+    def _set():
+        conn = get_conn()
+        conn.execute(
+            """
+            UPDATE users SET latitude = ?, longitude = ?, location_name = ?,
+                             location_updated_at = datetime('now')
+            WHERE user_id = ?
+            """,
+            (lat, lon, (name or "")[:100], user_id),
+        )
+        conn.commit()
+
+    await asyncio.get_event_loop().run_in_executor(None, _set)
+
+
+async def clear_location(user_id: int) -> bool:
+    """Forget a user's saved location. Returns True if one was stored."""
+    def _clear():
+        conn = get_conn()
+        cur = conn.execute(
+            """
+            UPDATE users SET latitude = NULL, longitude = NULL, location_name = NULL,
+                             location_updated_at = NULL
+            WHERE user_id = ? AND latitude IS NOT NULL
+            """,
+            (user_id,),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+    return await asyncio.get_event_loop().run_in_executor(None, _clear)

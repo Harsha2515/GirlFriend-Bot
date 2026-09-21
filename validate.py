@@ -97,6 +97,29 @@ def _partners():
 check("partner personas", _partners)
 
 
+def _tools():
+    """Offline only: validate.py gates deploys, so it must not need the network."""
+    from agent import tools
+    from agent.tools import registry
+    from agent.tools.images import is_blocked
+
+    expected = {"web_search", "get_weather", "find_photo", "generate_image"}
+    assert expected <= set(tools.names()), f"missing tools: {expected - set(tools.names())}"
+    assert all(d.name for d in tools.declarations()), "bad function declaration"
+
+    search = registry.get("web_search")
+    assert registry.validate_args(search, {"query": "ok"})[0] == {"query": "ok"}
+    assert registry.validate_args(search, {"query": "x", "user_id": 5})[0] is None, "extra arg accepted"
+    assert registry.validate_args(search, {"query": "x" * 1000})[0] is None, "over-long arg accepted"
+    assert registry.validate_args(search, {})[0] is None, "missing arg accepted"
+
+    assert is_blocked("a nude photo") and is_blocked("sexy teen") and not is_blocked("a red panda")
+    return f"{len(tools.names())} tools: {', '.join(sorted(expected))}"
+
+
+check("agent tools", _tools)
+
+
 # ── Reminder planning logic ───────────────────────────────────────────────────
 
 def _planner():

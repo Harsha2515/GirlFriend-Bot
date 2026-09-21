@@ -96,6 +96,15 @@ MESSAGE_RETENTION_PER_USER=400
 # Delete users inactive this many days (with all their data). They start over
 # as new users if they return. Blocked users and the admin are kept. 0 = never.
 INACTIVE_USER_DAYS=75
+
+# Tools. Optional free key from https://tavily.com lets web search cover live
+# news; without it, search uses Wikipedia + DuckDuckGo (facts, not news).
+TAVILY_API_KEY=
+
+# Per-user daily caps on tools (admin exempt). 0 = unlimited.
+SEARCH_DAILY_LIMIT=10
+PHOTO_DAILY_LIMIT=10
+IMAGE_DAILY_LIMIT=3
 ENVEOF
     chmod 600 "$APP_DIR/.env"
     warn "Edit $APP_DIR/.env with your two keys, then re-run this script."

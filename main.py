@@ -47,6 +47,14 @@ from bot.commands import (
     whoami,
 )
 from bot.handlers import handle_message, error_handler
+from bot.tool_commands import (
+    handle_location,
+    imagine_command,
+    location_command,
+    photo_command,
+    search_command,
+    weather_command,
+)
 from config import (
     ADMIN_USER_ID,
     INACTIVE_USER_DAYS,
@@ -199,6 +207,14 @@ def main() -> None:
     app.add_handler(CommandHandler("forget",    forget))
     app.add_handler(CommandHandler("help",      help_command))
     app.add_handler(CommandHandler("whoami",    whoami))
+
+    # Tools: weather, location, web search, photos, image generation.
+    app.add_handler(CommandHandler("weather",   weather_command))
+    app.add_handler(CommandHandler("location",  location_command))
+    app.add_handler(CommandHandler("search",    search_command))
+    app.add_handler(CommandHandler("photo",     photo_command))
+    app.add_handler(CommandHandler("imagine",   imagine_command))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
 
     # Admin only — silently ignored for everyone else.
     app.add_handler(CommandHandler("approve",   approve))

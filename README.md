@@ -96,6 +96,16 @@ Open Telegram, send `/start`, tell it whether you're male or female. Done 🎉
 | `/whoami` | Show your Telegram user ID |
 | `/help` | Show all commands |
 
+**Tools** (see [Tools](#tools-search-weather-photos-images) — or just ask in normal chat):
+
+| Command | Description |
+|---|---|
+| `/weather [city]` | Weather for your saved location, or any city |
+| `/location [city\|forget]` | Share, set, or delete your location |
+| `/search <question>` | Look something up online and answer |
+| `/photo <what>` | Find a real, openly-licensed photo |
+| `/imagine <idea>` | Create an image |
+
 **Admin only** (silently ignored for everyone else):
 
 | Command | Description |
@@ -153,6 +163,72 @@ without losing anything.
 
 ---
 
+## Tools: search, weather, photos, images
+
+Just ask naturally — *"will it rain tomorrow?"*, *"who wrote the Ramayana?"*,
+*"show me a red panda"*, *"draw us on a beach at sunset"* — and the persona
+answers in character, with the result attached.
+
+**How it works.** Gemini's function calling decides whether a message needs a
+tool. For ordinary chat it doesn't, so the reply costs exactly what it did
+before. When it does, the app — never the model — validates the request, runs
+the tool for that user only, and makes one more Gemini call to phrase the
+result in persona. That second call has no tools at all, so the model can't
+loop and text fetched from the web can't trigger further actions.
+
+| Tool | Provider | Key needed? | Gemini calls |
+|---|---|---|---|
+| Weather | [Open-Meteo](https://open-meteo.com) | No | +1 in chat · **0** via `/weather` |
+| Web search | Google grounding → Tavily → Wikipedia + DuckDuckGo | Tavily optional | +1 |
+| Find a photo | [Openverse](https://openverse.org) (openly-licensed) | No | +1 in chat · **0** via `/photo` |
+| Create an image | Gemini image model → [Pollinations.ai](https://pollinations.ai) | No | +1 in chat · **0** via `/imagine` |
+
+**What works on a free Gemini key — measured, not assumed:**
+
+- ✅ Function calling, on the lite models the bot uses.
+- ❌ **Google Search grounding** — refused on the free tier. The bot tries it
+  once, then skips it for 6 hours, so it never wastes calls.
+- ❌ **Gemini image generation** — the free tier's quota for image models is 0.
+  Images come from Pollinations instead.
+
+Both switch on automatically if the key ever gains access.
+
+**Web search and news.** Without a key, search uses Wikipedia and DuckDuckGo
+instant answers: fine for facts, but they **don't cover live news or scores**,
+and the bot says so rather than guessing. For current events, add a free
+[Tavily](https://tavily.com) key as `TAVILY_API_KEY`. Sources are appended to
+the reply by the app from the real results, so the model can't invent links.
+
+**Location.** Telegram never lets a bot read a user's location on its own. The
+first weather question shows a **📍 Share my location** button (phones only);
+on desktop, `/location <city>` works instead. The location is stored rounded to
+about 1 km, **never sent to Gemini** (only the place name and forecast are),
+and removed by `/location forget` or the inactive-user cleanup. Sharing it also
+sets your timezone automatically, which fixes reminder times for users outside
+India.
+
+**Limits** (per user per day; the admin is exempt; `0` = unlimited):
+
+| Setting | Default |
+|---|---|
+| `SEARCH_DAILY_LIMIT` | 10 |
+| `PHOTO_DAILY_LIMIT` | 10 |
+| `IMAGE_DAILY_LIMIT` | 3 |
+
+Weather has no cap: it's free, keyless, and cached for 15 minutes per area.
+Every Gemini call a tool makes still counts toward `GLOBAL_DAILY_API_LIMIT`.
+
+**Safety.** Requests for sexual content or images involving minors are refused
+before anything leaves the server. The bot only talks to the fixed APIs above
+and never downloads a URL supplied by a user or the model. Found photos are sent
+to Telegram by URL, so Telegram fetches them, not your server. Generated images
+are held in memory only long enough to send.
+
+> ⚠️ Image prompts are sent to Pollinations.ai and photo searches to Openverse —
+> third-party services. Weather lookups send only the rounded location.
+
+---
+
 ## Project Structure
 
 ```
@@ -162,14 +238,23 @@ without losing anything.
 │
 ├── agent/
 │   ├── client.py             # Shared Gemini client, retry + model fallback
-│   ├── llm.py                # Conversational reply path
+│   ├── agent.py              # Reply path: Gemini + tool calls
+│   ├── llm.py                # Conversation formatting helpers
 │   ├── persona.py            # System prompt builder per persona
-│   └── extractor.py          # Combined commitment + fact extraction
+│   ├── extractor.py          # Combined commitment + fact extraction
+│   └── tools/
+│       ├── base.py           # Tool / ToolContext / ToolResult types
+│       ├── registry.py       # Validation, limits, safe execution
+│       ├── web_search.py     # Grounding → Tavily → Wikipedia/DuckDuckGo
+│       ├── weather.py        # Open-Meteo forecast + geocoding
+│       └── images.py         # Openverse photos, image generation
 │
 ├── bot/
 │   ├── handlers.py           # Main message handler
 │   ├── commands.py           # All /commands
-│   └── onboarding.py         # Gender question, partner assignment, /switch
+│   ├── onboarding.py         # Gender question, partner assignment, /switch
+│   ├── tool_commands.py      # /weather /location /search /photo /imagine
+│   └── location.py           # "Share my location" button
 │
 ├── memory/
 │   ├── models.py             # SQLite schema + migrations
@@ -244,8 +329,8 @@ land in a queue; you get a Telegram notification and approve with
 
 **Free-tier guards — this is the part that matters.** Headcount is not the
 real constraint; Gemini calls per day are. Every message costs **2 API calls**
-(reply + analysis), so 50 chatty users would exhaust the free quota long
-before you noticed. Two ceilings prevent that:
+(reply + analysis), or **3** when it uses a tool, so 50 chatty users would
+exhaust the free quota long before you noticed. Two ceilings prevent that:
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -306,6 +391,12 @@ timezone is. Reminders already scheduled keep their original times.
 
 **Reminders not firing?** → The bot has to be running when the time comes. Check
 the startup log for `Restored reminders — N upcoming`.
+
+**Search doesn't know recent news?** → Expected without a Tavily key; see
+[Tools](#tools-search-weather-photos-images). Add `TAVILY_API_KEY` to `.env`.
+
+**No "Share my location" button?** → It only works in Telegram's phone apps. On
+desktop, use `/location Hyderabad`.
 
 **Want to reset everything?** → Delete `bot.db` and restart.
 

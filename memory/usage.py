@@ -144,11 +144,83 @@ async def prune_usage(keep_days: int = 90) -> int:
     """Drop usage rows older than keep_days. Returns rows deleted."""
     def _prune():
         conn = get_conn()
-        cur = conn.execute(
-            "DELETE FROM usage_daily WHERE day < date('now', ?)",
-            (f"-{keep_days} days",),
-        )
+        deleted = 0
+        for table in ("usage_daily", "tool_usage_daily"):
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE day < date('now', ?)",
+                (f"-{keep_days} days",),
+            )
+            deleted += cur.rowcount
         conn.commit()
-        return cur.rowcount
+        return deleted
 
     return await _run(_prune)
+
+
+# ── Tool usage ────────────────────────────────────────────────────────────────
+
+async def global_budget_left() -> int | None:
+    """
+    Gemini calls still available today across the whole bot, or None when
+    there is no global cap. Tools check this before spending extra calls, so
+    a tool-heavy turn can't push the key past the ceiling.
+    """
+    if GLOBAL_DAILY_API_LIMIT <= 0:
+        return None
+    counts = await get_today(GLOBAL_ROW)
+    return max(0, GLOBAL_DAILY_API_LIMIT - counts["global"]["api_calls"])
+
+
+async def get_tool_count(user_id: int, tool: str) -> int:
+    """How many times this user has run `tool` today."""
+    day = _today()
+
+    def _get():
+        row = get_conn().execute(
+            "SELECT count FROM tool_usage_daily WHERE day = ? AND user_id = ? AND tool = ?",
+            (day, user_id, tool),
+        ).fetchone()
+        return row["count"] if row else 0
+
+    return await _run(_get)
+
+
+async def record_tool_use(user_id: int, tool: str) -> None:
+    """Count one successful run of `tool` against today's per-user cap."""
+    day = _today()
+
+    def _record():
+        conn = get_conn()
+        conn.execute(
+            """
+            INSERT INTO tool_usage_daily (day, user_id, tool, count) VALUES (?, ?, ?, 1)
+            ON CONFLICT(day, user_id, tool) DO UPDATE SET count = count + 1
+            """,
+            (day, user_id, tool),
+        )
+        conn.commit()
+
+    await _run(_record)
+
+
+async def record_api_calls(user_id: int, api_calls: int) -> None:
+    """
+    Count Gemini calls that weren't part of a chat message -- e.g. a direct
+    /imagine that used Gemini's image model -- so the global budget stays true.
+    """
+    if api_calls <= 0:
+        return
+    day = _today()
+
+    def _record():
+        conn = get_conn()
+        conn.executemany(
+            """
+            INSERT INTO usage_daily (day, user_id, messages, api_calls) VALUES (?, ?, 0, ?)
+            ON CONFLICT(day, user_id) DO UPDATE SET api_calls = api_calls + excluded.api_calls
+            """,
+            [(day, user_id, api_calls), (day, GLOBAL_ROW, api_calls)],
+        )
+        conn.commit()
+
+    await _run(_record)

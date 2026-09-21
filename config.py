@@ -67,6 +67,18 @@ MESSAGE_RETENTION_PER_USER: int = _int_env("MESSAGE_RETENTION_PER_USER", 400)
 # 0 disables the cleanup.
 INACTIVE_USER_DAYS: int = _int_env("INACTIVE_USER_DAYS", 75)
 
+# ── Tools: web search, weather, photos, image generation ──────────────────────
+# Optional. With a Tavily key, web search covers live news and current events
+# (free tier at https://tavily.com). Without one, search falls back to keyless
+# Wikipedia + DuckDuckGo instant answers, which handle facts but not news.
+TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "").strip()
+
+# Per-user daily caps on each tool. The admin is exempt. 0 = unlimited.
+# Weather has no cap: it's served from a keyless API and cached.
+SEARCH_DAILY_LIMIT: int = _int_env("SEARCH_DAILY_LIMIT", 10)
+PHOTO_DAILY_LIMIT: int = _int_env("PHOTO_DAILY_LIMIT", 10)
+IMAGE_DAILY_LIMIT: int = _int_env("IMAGE_DAILY_LIMIT", 3)
+
 # ── Runtime guards ────────────────────────────────────────────────────────────
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(

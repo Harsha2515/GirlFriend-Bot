@@ -354,10 +354,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/cancel <id> — Cancel a commitment\n"
         "/facts — See what I remember about you (/facts clear to wipe)\n"
         "/forget — Clear conversation history\n"
-        "/whoami — Show your Telegram user ID\n"
+        "/whoami — Show your Telegram user ID\n\n"
+        "🧰 Tools\n"
+        "/weather [city] — Weather for you or any city\n"
+        "/location — Share, change or delete your location\n"
+        "/search <question> — Look something up online\n"
+        "/photo <what> — Find a real photo\n"
+        "/imagine <idea> — Create an image\n\n"
         "/help — Show this message\n\n"
         "Just chat normally. Anything you mention having to do gets picked up "
-        "automatically — I'll nudge you the night before and an hour ahead."
+        "automatically — I'll nudge you the night before and an hour ahead. "
+        "You can also just ask things like \"will it rain tomorrow?\" or "
+        "\"show me a picture of the Taj Mahal\"."
     )
 
 

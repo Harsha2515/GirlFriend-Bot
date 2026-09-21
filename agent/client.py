@@ -42,22 +42,43 @@ ANALYZE_MODELS = [
     "gemini-flash-latest",
 ]
 
+# Google Search grounding and native image output. Neither is included in
+# every free-tier key -- the tools that use these treat a refusal as "not
+# available right now" and fall back to keyless providers.
+GROUNDING_MODELS = ["gemini-flash-lite-latest"]
+IMAGE_MODELS = ["gemini-2.5-flash-image"]
+
 MAX_RETRIES = 2
 RETRY_DELAY = 1     # seconds between retries on the same model
 
 
-def _is_rate_limited(exc: Exception) -> bool:
+def is_rate_limited(exc: Exception) -> bool:
     text = str(exc)
     return "RESOURCE_EXHAUSTED" in text or "429" in text
 
 
-async def generate(
+def _response_has_content(response) -> bool:
+    """True if the model produced text, a tool call, or an image."""
+    try:
+        parts = response.candidates[0].content.parts or []
+    except (AttributeError, IndexError, TypeError):
+        return False
+    return any(
+        getattr(p, "text", None) or getattr(p, "function_call", None)
+        or getattr(p, "inline_data", None)
+        for p in parts
+    )
+
+
+async def generate_response(
     contents,
     config: genai_types.GenerateContentConfig,
     models: list[str],
-) -> str:
+):
     """
-    Run generate_content against each model in `models` until one succeeds.
+    Run generate_content against each model in `models` until one succeeds,
+    and return the full SDK response -- needed when the reply may be a tool
+    call or an image rather than plain text.
 
     The SDK call is blocking, so it runs in the default executor to keep the
     Telegram event loop responsive.
@@ -78,21 +99,41 @@ async def generate(
                         config=config,
                     ),
                 )
-
-                text = response.text.strip() if response and response.text else ""
-                if not text:
+                if not _response_has_content(response):
                     raise ValueError("Empty response from Gemini")
-                return text
+                return response
 
             except Exception as exc:
                 last_exception = exc
                 logger.warning(
                     f"Gemini '{model_name}' attempt {attempt}/{MAX_RETRIES} failed: {exc}"
                 )
-                if _is_rate_limited(exc):
+                if is_rate_limited(exc):
                     break  # this model is out of quota — try the next one now
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_DELAY)
 
     logger.error(f"All Gemini models exhausted: {models}")
     raise last_exception or RuntimeError("LLM call failed after all retries")
+
+
+def response_text(response) -> str:
+    """Concatenate the text parts of a response, ignoring tool calls/images."""
+    try:
+        parts = response.candidates[0].content.parts or []
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    return "".join(p.text for p in parts if getattr(p, "text", None)).strip()
+
+
+async def generate(
+    contents,
+    config: genai_types.GenerateContentConfig,
+    models: list[str],
+) -> str:
+    """Like generate_response(), but for callers that only want text."""
+    response = await generate_response(contents, config, models)
+    text = response_text(response)
+    if not text:
+        raise ValueError("Gemini returned no text")
+    return text

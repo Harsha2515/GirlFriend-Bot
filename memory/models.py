@@ -138,6 +138,15 @@ def _migrate_users(conn: sqlite3.Connection) -> None:
             """
         )
 
+    # Saved location for weather. Stored rounded to ~1 km (2 decimal places):
+    # precise enough for a forecast, too coarse to pinpoint where someone
+    # lives. NULL means "never shared". Lives on the users row, so it is
+    # removed with the user by the inactive-user cleanup.
+    for column in ("latitude REAL", "longitude REAL",
+                   "location_name TEXT", "location_updated_at TEXT"):
+        if column.split()[0] not in columns:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {column}")
+
 
 def init_db() -> None:
     """Create all tables if they don't exist, then apply migrations."""
@@ -184,6 +193,15 @@ def init_db() -> None:
             messages  INTEGER NOT NULL DEFAULT 0,
             api_calls INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (day, user_id)
+        );
+
+        -- How many times each user ran each tool today, for per-tool caps.
+        CREATE TABLE IF NOT EXISTS tool_usage_daily (
+            day     TEXT    NOT NULL,            -- 'YYYY-MM-DD' in UTC
+            user_id INTEGER NOT NULL,
+            tool    TEXT    NOT NULL,
+            count   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (day, user_id, tool)
         );
         """
     )

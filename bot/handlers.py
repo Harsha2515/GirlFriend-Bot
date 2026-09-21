@@ -16,12 +16,14 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Update
+from telegram import LinkPreviewOptions, Update
 from telegram.ext import ContextTypes
 
+from agent.agent import AgentReply, format_sources, run_agent
 from agent.extractor import analyze_message
-from agent.llm import call_llm
 from agent.persona import build_system_prompt
+from agent.tools.base import Attachment, ToolContext
+from bot.location import location_keyboard
 from bot.onboarding import (
     PERSONA_BUTTON_MAP,
     apply_gender,
@@ -218,10 +220,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(reason)
         return
 
+    await respond(update, context, profile, user_text)
+
+
+async def respond(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    profile: dict,
+    user_text: str,
+    force_tool: str | None = None,
+) -> None:
+    """
+    Produce and send the reply to one message: Gemini (with tools), reminder
+    extraction in parallel, photos, sources, then persistence and usage.
+
+    Shared by ordinary chat and the /search command, which passes
+    `force_tool` to make the model search instead of deciding for itself.
+    Callers must already have passed access control and the free-tier guards.
+    """
+    tg_id = update.effective_user.id
+
     # ── 4. Build conversation context ─────────────────────────────────────────
     active_persona = profile.get("active_persona", "girlfriend")
     history        = trim_to_budget(await get_context(tg_id), max_tokens=3000)
     system_prompt  = await build_system_prompt(profile, active_persona)
+    tool_ctx       = ToolContext(
+        user_id=tg_id, profile=profile, persona=active_persona,
+        is_admin=tg_id == ADMIN_USER_ID,
+    )
 
     await context.bot.send_chat_action(chat_id=tg_id, action="typing")
 
@@ -231,18 +257,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     try:
-        reply = await call_llm(
+        agent_reply: AgentReply = await run_agent(
             system_prompt = system_prompt,
             history       = history,
             user_message  = user_text,
+            ctx           = tool_ctx,
+            force_tool    = force_tool,
         )
     except Exception as exc:
-        logger.error(f"LLM call failed for user {tg_id}: {exc}")
+        logger.error(f"LLM call failed for user {tg_id}: {type(exc).__name__}: {exc}")
         analysis_task.cancel()
         await update.message.reply_text(
             "Sorry, I'm having a brain moment 🥴 Try again in a sec."
         )
         return
+
+    reply = agent_reply.text or "🙂"
 
     # Analysis must never block or break the conversation.
     try:
@@ -258,19 +288,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     message = reply
     if confirmations:
-        message = f"{reply}\n\n" + "\n".join(confirmations)
+        message = f"{message}\n\n" + "\n".join(confirmations)
+    message += format_sources(agent_reply.sources)
 
     # No parse_mode: the reply is LLM-generated and a stray '*' or '_' would
     # make Telegram reject the whole message.
-    await update.message.reply_text(message)
+    markup = location_keyboard() if agent_reply.needs_location else None
+    await update.message.reply_text(
+        message, reply_markup=markup,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+    sent_photos = await send_attachments(context.bot, tg_id, agent_reply.attachments)
 
     # ── 7. Persist the turn and anything new we learned ──────────────────────
-    await save_message(tg_id, role="user",      content=user_text, persona=active_persona)
-    await save_message(tg_id, role="assistant", content=reply,     persona=active_persona)
+    remembered = reply + ("\n[sent a photo]" * sent_photos)
+    await save_message(tg_id, role="user",      content=user_text,  persona=active_persona)
+    await save_message(tg_id, role="assistant", content=remembered, persona=active_persona)
     await _store_facts(tg_id, analysis["facts"])
 
     # Counted after the fact, so a failed turn doesn't spend the user's budget.
-    await record_message(tg_id)
+    # Reply-path calls (1, or 2+ with tools) plus the one analysis call.
+    await record_message(tg_id, api_calls=agent_reply.gemini_calls + 1)
+
+
+async def send_attachments(bot, chat_id: int, attachments: list[Attachment]) -> int:
+    """
+    Send photos to the user. Returns how many were delivered.
+
+    Found photos go by URL -- Telegram's servers fetch them, so our server
+    never downloads arbitrary images. If Telegram can't fetch the full-size
+    file, the smaller thumbnail is tried before giving up.
+    """
+    sent = 0
+    for att in attachments:
+        caption = (att.caption or "")[:1024]
+        candidates = [att.data] if att.data else [u for u in (att.url, att.fallback_url) if u]
+        for photo in candidates:
+            try:
+                await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption)
+                sent += 1
+                break
+            except Exception as exc:
+                logger.info(f"send_photo failed for user {chat_id}: {type(exc).__name__}")
+        else:
+            try:
+                await bot.send_message(chat_id=chat_id, text="I couldn't send that picture, sorry 😕")
+            except Exception:
+                pass
+    return sent
 
 
 # ── Global error handler ───────────────────────────────────────────────────────

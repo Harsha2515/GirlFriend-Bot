@@ -14,3 +14,8 @@ APScheduler==3.10.4
 # and only arrives transitively via tzlocal otherwise — declare it directly
 # since every reminder time depends on it.
 tzdata>=2024.1
+
+# HTTP client for the tools (weather, search, photos, image generation).
+# Already installed as a python-telegram-bot dependency; listed because the
+# tools import it directly.
+httpx>=0.27
