@@ -113,52 +113,154 @@ async def _search_tavily(query: str) -> dict | None:
 
 # ── Provider 3: keyless (DuckDuckGo instant answers + Wikipedia) ──────────────
 
+# Words that say nothing about WHICH page is relevant. "Oppenheimer film" should
+# match "Oppenheimer (film)" on "oppenheimer", not on "film" -- otherwise every
+# film page would count as relevant to every film question.
+_GENERIC = {
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "and", "or", "is", "are",
+    "was", "who", "what", "when", "where", "why", "how", "tell", "me", "about",
+    "search", "info", "information", "details", "movie", "movies", "film", "films",
+    "series", "show", "song", "songs", "book", "person", "latest", "news", "list",
+    "wikipedia", "soundtrack", "filmography", "discography",
+}
+
+# Words the model tacks onto queries ("Kalki 2898 AD movie info") that never
+# appear on the page itself. Wikipedia search requires every word to match, so
+# one of these is enough to return nothing at all. Stripped before searching.
+_FILLER = {
+    "info", "information", "details", "detail", "about", "tell", "me", "please",
+    "link", "links", "source", "sources", "url", "urls", "website", "article",
+    "articles", "review", "reviews", "facts", "fact", "summary", "overview",
+    "bio", "biography", "wiki", "wikipedia", "search", "find", "look", "up",
+    "some", "more", "latest", "news", "everything", "all", "know", "read",
+    "and", "or",
+}
+
+
+def _query_variants(query: str) -> list[str]:
+    """
+    Queries to try, most specific first:
+      'Kalki 2898 AD movie info' -> ['Kalki 2898 AD movie', 'Kalki 2898 AD']
+    The first keeps words like 'movie' that help pick the right page among
+    namesakes; the second is the bare subject, if the first finds nothing.
+    """
+    words = re.findall(r"[\w.'-]+", query)
+    no_filler = [w for w in words if w.lower().strip(".") not in _FILLER]
+    core = [w for w in no_filler if w.lower().strip(".") not in _GENERIC]
+    variants = []
+    for v in (" ".join(no_filler), " ".join(core), query.strip()):
+        if v and v not in variants:
+            variants.append(v)
+    return variants
+
+
+# How much of the best article's introduction to hand the model. The intro is
+# where Wikipedia puts the key facts -- this is the "matter" of the answer.
+INTRO_CHARS = 2500
+
+
+def _tokens(text: str) -> set[str]:
+    """Meaningful lowercase words: 'M.S. Dhoni' -> {'ms', 'dhoni'}."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower().replace(".", ""))
+    return {w for w in words if w not in _GENERIC and w not in _FILLER}
+
+
+def _relevance(query: str, title: str) -> float:
+    """
+    Share of a page title's meaningful words that also appear in the query.
+    'MS Dhoni' vs 'MS Dhoni' = 1.0; vs 'M.S. Dhoni: The Untold Story' = 0.5;
+    vs 'Seven (brand)' = 0.0.
+    """
+    q, t = _tokens(query), _tokens(title)
+    if not q or not t:
+        return 0.0
+    return len(q & t) / len(t)
+
+
+# IPA pronunciation blocks, e.g. "Dhoni ([məˈɦeːnd̪ɾə ˈsɪŋɡʱ] ; born 1981)".
+# A bracketed block counts as pronunciation if it contains any character from
+# the Unicode IPA / spacing-modifier / combining-mark ranges.
+_IPA = re.compile(r"\[[^\]]*[ɐ-˿̀-ͯ][^\]]*\]\s*;?\s*")
+
+
+def _strip_pronunciation(text: str) -> str:
+    text = _IPA.sub("", text)
+    text = re.sub(r"\(\s*\)", "", re.sub(r"\(\s+", "(", text))
+    return re.sub(r" {2,}", " ", text)
+
+
 async def _search_keyless(query: str) -> dict | None:
-    results, answer = [], ""
+    """
+    Wikipedia does the heavy lifting: find the page that actually matches, then
+    fetch its full introduction. DuckDuckGo's instant answer is a supplement.
+    Pages sharing no meaningful word with the query are dropped entirely.
+    """
+    candidates, ddg_answer = [], ""
+    variants = _query_variants(query)
     async with http_client() as http:
         try:
-            r = await http.get("https://api.duckduckgo.com/",
-                               params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1})
+            r = await http.get("https://api.duckduckgo.com/", params={
+                "q": variants[0], "format": "json", "no_html": 1, "skip_disambig": 1})
             r.raise_for_status()
             j = r.json()
-            if j.get("AbstractText"):
-                answer = _clean(j["AbstractText"], 800)
-                results.append({"title": j.get("Heading") or query,
-                                "snippet": answer[:300], "url": j.get("AbstractURL", "")})
-            elif j.get("Answer"):
-                answer = _clean(str(j["Answer"]), 400)
+            ddg_answer = _clean(j.get("AbstractText") or str(j.get("Answer") or ""), 600)
         except Exception as exc:
             logger.info(f"DuckDuckGo lookup failed: {type(exc).__name__}")
 
-        try:
-            r = await http.get("https://en.wikipedia.org/w/api.php", params={
-                "action": "query", "list": "search", "srsearch": query,
-                "format": "json", "srlimit": 3, "utf8": 1})
-            r.raise_for_status()
-            for hit in r.json().get("query", {}).get("search", []):
+        # Try the query variants in turn, stopping at the first that finds a
+        # relevant page. Most queries resolve on the first attempt.
+        for attempt in variants:
+            try:
+                r = await http.get("https://en.wikipedia.org/w/api.php", params={
+                    "action": "query", "list": "search", "srsearch": attempt,
+                    "format": "json", "srlimit": 6, "utf8": 1})
+                r.raise_for_status()
+                hits = r.json().get("query", {}).get("search", [])
+            except Exception as exc:
+                logger.info(f"Wikipedia search failed: {type(exc).__name__}")
+                break
+            for rank, hit in enumerate(hits):
                 title = hit.get("title", "")
-                results.append({
-                    "title": f"{title} (Wikipedia)",
+                score = _relevance(query, title)
+                if score == 0.0:
+                    continue          # e.g. 'Seven (brand)' for 'MS Dhoni'
+                candidates.append({
+                    "title": title, "score": score, "rank": rank,
                     "snippet": _clean(hit.get("snippet")),
                     "url": "https://en.wikipedia.org/wiki/" + title.replace(" ", "_"),
                 })
-            # One full summary of the best Wikipedia hit, for real substance.
-            wiki = [x for x in results if x["title"].endswith("(Wikipedia)")]
-            if wiki and not answer:
-                page = wiki[0]["url"].rsplit("/", 1)[-1]
-                s = await http.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{page}")
-                if s.status_code == 200:
-                    answer = _clean(s.json().get("extract"), 800)
-        except Exception as exc:
-            logger.info(f"Wikipedia lookup failed: {type(exc).__name__}")
+            if candidates:
+                break
 
-    if not results and not answer:
+        # Best match first; Wikipedia's own ranking breaks ties.
+        candidates.sort(key=lambda c: (-c["score"], c["rank"]))
+
+        intro = ""
+        if candidates:
+            try:
+                r = await http.get("https://en.wikipedia.org/w/api.php", params={
+                    "action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1,
+                    "redirects": 1, "titles": candidates[0]["title"], "format": "json"})
+                r.raise_for_status()
+                pages = r.json().get("query", {}).get("pages", {})
+                intro = next(iter(pages.values()), {}).get("extract", "")
+                intro = _strip_pronunciation(re.sub(r"\n{2,}", "\n", intro)).strip()[:INTRO_CHARS]
+            except Exception as exc:
+                logger.info(f"Wikipedia extract failed: {type(exc).__name__}")
+
+    if not candidates and not ddg_answer:
         return None
+
+    results = [{"title": c["title"], "snippet": c["snippet"], "url": c["url"]}
+               for c in candidates[:MAX_RESULTS]]
     return {
-        "provider": "keyless", "answer": answer, "results": results[:MAX_RESULTS],
-        "note": ("These results come from Wikipedia and DuckDuckGo and may not "
-                 "include recent news. If the question is about very recent events "
-                 "and nothing here covers it, say you couldn't find current information."),
+        "provider": "keyless",
+        "answer": intro or ddg_answer,
+        "main_topic": candidates[0]["title"] if candidates else query,
+        "results": results,
+        "note": ("From Wikipedia and DuckDuckGo. Good for background facts, but may "
+                 "not include very recent news or live scores -- if the question is "
+                 "about something recent that isn't covered here, say so."),
     }
 
 
@@ -177,7 +279,14 @@ async def _web_search(ctx: ToolContext, args: dict) -> ToolResult:
     query = args["query"]
     found = await search(query)
     if not found:
-        return ToolResult.error("The search didn't return anything useful.")
+        # Not a dead end for the user: the model is told to answer from what it
+        # reliably knows, and to be upfront that the lookup came back empty.
+        return ToolResult(ok=False, data={
+            "error": "The search didn't find anything for this.",
+            "instruction": ("Answer from your own knowledge if you reliably know the topic, "
+                            "and mention briefly that you couldn't find more online. "
+                            "If you don't know it, say so honestly."),
+        })
 
     calls = found.pop("gemini_calls", 0)
     sources = [(r["title"], r["url"]) for r in found["results"] if r.get("url")][:3]

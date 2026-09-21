@@ -9,7 +9,7 @@ agent/agent.py — The reply path, with tools.
         ↓
     Gemini (call 2, NO tools) phrases the result in persona
         ↓
-    Reply text + any photos + source links
+    Reply text + any photos (+ source links, only if the user asked for links)
 
 Deliberate limits:
   * One round of tools per message, at most MAX_TOOL_CALLS calls. The second
@@ -20,6 +20,7 @@ Deliberate limits:
     written by the model, so they can't be hallucinated.
 """
 import logging
+import re
 from dataclasses import dataclass, field
 
 from google.genai import types as genai_types
@@ -33,6 +34,34 @@ from memory.usage import global_budget_left
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_CALLS = 2
+
+# Links are only shown when the user actually asks for them. Otherwise the
+# answer itself is the point -- a list of URLs is not an answer.
+_WANTS_LINKS = re.compile(
+    r"\b(links?|urls?|sources?|websites?|references?|articles?|citations?|read more)\b",
+    re.IGNORECASE,
+)
+
+
+def wants_links(user_message: str) -> bool:
+    return bool(_WANTS_LINKS.search(user_message or ""))
+
+
+# Added to the system prompt for the call that phrases search results. The
+# persona prompt favours short, chatty replies -- right for small talk, wrong
+# when someone has asked to learn about something.
+INFO_ANSWER_GUIDANCE = """
+The user asked to learn about something, and you just looked it up. Now give a
+genuinely informative answer: the key facts from the search results -- who or
+what it is, the most important details, notable achievements, dates, numbers.
+Aim for a solid paragraph or two (roughly 6 to 10 sentences), or a few short
+lines starting with "-" if it's a list of facts. Stay in your own voice and
+warmth, but the information comes first; don't reduce it to a one-liner or turn
+it back into a question. You may add well-known facts you are confident about
+if the results are thin. If the results don't answer the question (for
+example, very recent news), say so honestly instead of guessing.
+Do not include any URLs or links -- the app handles those.
+""".strip()
 
 
 @dataclass
@@ -94,6 +123,11 @@ async def run_agent(
         genai_types.Content(role="user", parts=[genai_types.Part(text=user_message)])
     ]
 
+    # Asked for links? Then we must actually search -- answering from memory
+    # would leave nothing real to link to.
+    if force_tool is None and wants_links(user_message):
+        force_tool = "web_search"
+
     first = await generate_response(contents, _config(system_prompt, True, force_tool), CHAT_MODELS)
     calls = _function_calls(first)
     reply = AgentReply(text="", gemini_calls=1)
@@ -116,11 +150,19 @@ async def run_agent(
     if len(calls) > MAX_TOOL_CALLS:
         logger.info(f"Ignored {len(calls) - MAX_TOOL_CALLS} extra tool call(s) for user {ctx.user_id}")
 
+    if not wants_links(user_message):
+        reply.sources = []
+
     # ── Second call: phrase the results in persona, with no tools ─────────────
     budget = await global_budget_left()
     if budget is not None and budget < 1:
         reply.text = _fallback_text(results)
         return reply
+
+    # Any search attempt means the user wants information -- even if the search
+    # itself came back empty, the answer should still have substance.
+    searched = any(name == "web_search" for name, _ in results)
+    phrasing_prompt = f"{system_prompt}\n\n{INFO_ANSWER_GUIDANCE}" if searched else system_prompt
 
     function_responses = [
         genai_types.Part.from_function_response(name=name, response=result.data)
@@ -131,7 +173,7 @@ async def run_agent(
         genai_types.Content(role="user", parts=function_responses),
     ]
     try:
-        second = await generate_response(followup, _config(system_prompt, False), CHAT_MODELS)
+        second = await generate_response(followup, _config(phrasing_prompt, False), CHAT_MODELS)
         reply.gemini_calls += 1
         reply.text = response_text(second) or _fallback_text(results)
     except Exception as exc:

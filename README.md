@@ -193,11 +193,22 @@ loop and text fetched from the web can't trigger further actions.
 
 Both switch on automatically if the key ever gains access.
 
-**Web search and news.** Without a key, search uses Wikipedia and DuckDuckGo
-instant answers: fine for facts, but they **don't cover live news or scores**,
-and the bot says so rather than guessing. For current events, add a free
-[Tavily](https://tavily.com) key as `TAVILY_API_KEY`. Sources are appended to
-the reply by the app from the real results, so the model can't invent links.
+**Web search answers, not links.** Ask *"search about the movie Kalki 2898 AD"*
+or *"look up MS Dhoni"* and you get a real, informative answer — who or what
+it is, key facts, dates, achievements — in the persona's voice. Links are only
+added when you ask for them (*"give me links about…"*, *"any sources?"*), and
+they come from the actual results, so the model can't invent them.
+
+Behind the scenes, filler words the model adds to queries ("info", "details",
+"reviews") are stripped, pages unrelated to the question are dropped, and the
+answer is built from the full introduction of the best-matching Wikipedia
+article. If a search finds nothing, the bot answers from what it reliably
+knows and says the lookup came up empty.
+
+**News.** Without a key, search uses Wikipedia and DuckDuckGo: good for people,
+movies, places and facts, but they **don't cover live news or scores**, and the
+bot says so rather than guessing. For current events, add a free
+[Tavily](https://tavily.com) key as `TAVILY_API_KEY`.
 
 **Location.** Telegram never lets a bot read a user's location on its own. The
 first weather question shows a **📍 Share my location** button (phones only);
